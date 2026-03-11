@@ -1,9 +1,74 @@
+// devcontainer.json — ferridian GPU renderer dev environment
+//
+// GPU PASSTHROUGH NOTES:
+//   Linux:        Works out of the box if the DRI device exists.
+//                 Run `xhost +local:docker` on your host before opening
+//                 the container to allow X11 connections.
+//
+//   Windows/WSL2: GPU passthrough works via WSLg (built-in display server).
+//                 Ensure NVIDIA/AMD/Intel WSL2 drivers are installed.
+//                 DISPLAY is forwarded automatically by WSLg.
+//
+//   macOS:        Docker Desktop cannot pass through the Metal GPU to Linux
+//                 containers. The renderer will use Mesa software (Lavapipe).
+//                 Comment out the '--device=/dev/dri' runArg below to
+//                 prevent container startup failure on macOS.
 {
     "name": "ferridian",
     "build": {
         "context": "..",
         "dockerfile": "Dockerfile"
     },
+
+    // Mark GPU as optional so the devcontainer still opens without one.
+    "hostRequirements": {
+        "gpu": "optional"
+    },
+
+    // -----------------------------------------------------------------------
+    // GPU device access
+    //   --device=/dev/dri   AMD/Intel/Nouveau DRI node (Linux & WSL2).
+    //                       Remove this line on macOS — the device doesn't
+    //                       exist there and Docker will refuse to start.
+    //   --group-add=video   Lets the vscode user read GPU device nodes.
+    // -----------------------------------------------------------------------
+    "runArgs": [
+        "--device=/dev/dri",
+        "--group-add=video"
+    ],
+
+    // -----------------------------------------------------------------------
+    // Display environment
+    //   DISPLAY / WAYLAND_DISPLAY  forwarded from the host so winit can
+    //   open a window.  On WSL2 these are set automatically by WSLg.
+    //   On Linux run: xhost +local:docker
+    //   On Windows (non-WSL2) install VcXsrv/X410 and set DISPLAY=host.docker.internal:0.0
+    //
+    //   XDG_RUNTIME_DIR    fixed path inside the container for Wayland
+    //                      socket and other runtime files.
+    //
+    //   NVIDIA_*           enable NVIDIA GPU passthrough when the
+    //                      nvidia-container-toolkit is installed.
+    // -----------------------------------------------------------------------
+    "containerEnv": {
+        "DISPLAY": "${localEnv:DISPLAY}",
+        "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY}",
+        "XDG_RUNTIME_DIR": "/tmp/runtime-dir",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "NVIDIA_DRIVER_CAPABILITIES": "graphics,utility,compute"
+    },
+
+    // X11 Unix socket — bind-mount from host so X11 forwarding works.
+    // On macOS without XQuartz this path won't exist; Docker will mount
+    // an empty directory (harmless — Wayland or software rendering still work).
+    "mounts": [
+        "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind,consistency=cached"
+    ],
+
+    // Allow X11 connections from Docker on the host before container starts.
+    // Safe to fail silently on Windows/macOS.
+    "initializeCommand": "xhost +local:docker 2>/dev/null || true",
+
     "features": {
         "ghcr.io/devcontainers/features/java:1": {
             "installGradle": true,
