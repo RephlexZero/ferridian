@@ -1878,6 +1878,475 @@ impl FrameTimings {
 }
 
 // ---------------------------------------------------------------------------
+// GPU timestamp profiler — uses wgpu timestamp queries to measure per-pass
+// GPU execution time with nanosecond precision.
+// ---------------------------------------------------------------------------
+
+/// A named span in the GPU timeline, with a begin and end timestamp index.
+#[derive(Clone, Debug)]
+struct GpuTimestampSpan {
+    label: String,
+    begin_index: u32,
+    end_index: u32,
+}
+
+/// Per-pass GPU timing result in seconds.
+#[derive(Clone, Debug)]
+pub struct GpuPassTiming {
+    pub label: String,
+    pub duration_ms: f64,
+}
+
+/// Accumulated statistics for a single pass over many frames.
+#[derive(Clone, Debug)]
+pub struct GpuPassStats {
+    pub label: String,
+    pub avg_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub last_ms: f64,
+}
+
+/// Complete frame breakdown from the GPU profiler.
+#[derive(Clone, Debug)]
+pub struct GpuFrameProfile {
+    pub pass_timings: Vec<GpuPassTiming>,
+    pub total_gpu_ms: f64,
+}
+
+/// GPU-side profiler that uses timestamp queries to measure per-pass GPU time.
+///
+/// Each frame, the profiler allocates timestamp pairs (begin/end) for each
+/// render or compute pass. After command submission, the timestamps are
+/// resolved into a readback buffer; the *next* frame reads back the previous
+/// frame's results to avoid stalling the pipeline.
+///
+/// Usage:
+/// ```ignore
+/// // During render loop:
+/// profiler.begin_frame();
+/// for pass in passes {
+///     let ts = profiler.begin_pass("GBufferFill");
+///     // ... set up render/compute pass with ts as timestamp_writes ...
+///     profiler.end_pass();
+/// }
+/// profiler.resolve(&mut encoder);
+/// // submit encoder ...
+/// if let Some(profile) = profiler.read_back(&device) {
+///     for p in &profile.pass_timings {
+///         println!("{}: {:.3}ms", p.label, p.duration_ms);
+///     }
+/// }
+/// ```
+pub struct GpuProfiler {
+    enabled: bool,
+    /// Number of timestamp pairs we can store per frame.
+    max_passes: u32,
+    /// Two query sets for double-buffering (current frame vs readback frame).
+    query_sets: [wgpu::QuerySet; 2],
+    /// Two resolve buffers — one is written by the GPU, one is mapped for CPU read.
+    resolve_buffers: [wgpu::Buffer; 2],
+    /// Staging buffers for MAP_READ (resolve buffers use COPY_DST | QUERY_RESOLVE).
+    readback_buffers: [wgpu::Buffer; 2],
+    /// Which buffer index (0 or 1) is being written this frame.
+    write_index: usize,
+    /// Spans recorded during the current frame (interior mutability for &self allocation).
+    current_spans: std::cell::RefCell<Vec<GpuTimestampSpan>>,
+    /// Spans from the previous frame (matching the buffer being read back).
+    previous_spans: Vec<GpuTimestampSpan>,
+    /// Next timestamp slot to allocate (interior mutability for &self allocation).
+    next_slot: std::cell::Cell<u32>,
+    /// Nanoseconds per GPU timestamp tick (from the adapter).
+    timestamp_period: f32,
+    /// Rolling statistics per pass label.
+    stats: Vec<GpuPassStatsAccum>,
+    /// How many frames of history to keep for statistics.
+    history_len: usize,
+    /// Whether the readback buffer has been mapped and is ready to read.
+    readback_pending: bool,
+}
+
+struct GpuPassStatsAccum {
+    label: String,
+    ring: Vec<f64>,
+    cursor: usize,
+    filled: bool,
+}
+
+impl GpuPassStatsAccum {
+    fn new(label: String, capacity: usize) -> Self {
+        Self {
+            label,
+            ring: vec![0.0; capacity.max(1)],
+            cursor: 0,
+            filled: false,
+        }
+    }
+
+    fn push(&mut self, ms: f64) {
+        self.ring[self.cursor] = ms;
+        self.cursor += 1;
+        if self.cursor >= self.ring.len() {
+            self.cursor = 0;
+            self.filled = true;
+        }
+    }
+
+    fn count(&self) -> usize {
+        if self.filled {
+            self.ring.len()
+        } else {
+            self.cursor
+        }
+    }
+
+    fn stats(&self) -> GpuPassStats {
+        let n = self.count();
+        if n == 0 {
+            return GpuPassStats {
+                label: self.label.clone(),
+                avg_ms: 0.0,
+                min_ms: 0.0,
+                max_ms: 0.0,
+                last_ms: 0.0,
+            };
+        }
+        let slice = &self.ring[..n];
+        let sum: f64 = slice.iter().sum();
+        let min = slice.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let last = if self.cursor == 0 {
+            self.ring[self.ring.len() - 1]
+        } else {
+            self.ring[self.cursor - 1]
+        };
+        GpuPassStats {
+            label: self.label.clone(),
+            avg_ms: sum / n as f64,
+            min_ms: min,
+            max_ms: max,
+            last_ms: last,
+        }
+    }
+}
+
+impl GpuProfiler {
+    /// Create a new GPU profiler. Returns `None` if timestamp queries are not
+    /// supported by the adapter.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        max_passes: u32,
+        history_frames: usize,
+    ) -> Self {
+        let _ = queue; // used for timestamp_period in the future if needed
+        let max_timestamps = max_passes * 2; // begin + end per pass
+
+        let query_sets = [
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("GpuProfiler QuerySet 0"),
+                ty: wgpu::QueryType::Timestamp,
+                count: max_timestamps,
+            }),
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("GpuProfiler QuerySet 1"),
+                ty: wgpu::QueryType::Timestamp,
+                count: max_timestamps,
+            }),
+        ];
+
+        let buf_size = (max_timestamps as u64) * std::mem::size_of::<u64>() as u64;
+
+        let resolve_buffers = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GpuProfiler Resolve 0"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GpuProfiler Resolve 1"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+        ];
+
+        let readback_buffers = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GpuProfiler Readback 0"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GpuProfiler Readback 1"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
+
+        Self {
+            enabled: true,
+            max_passes,
+            query_sets,
+            resolve_buffers,
+            readback_buffers,
+            write_index: 0,
+            current_spans: std::cell::RefCell::new(Vec::with_capacity(max_passes as usize)),
+            previous_spans: Vec::new(),
+            next_slot: std::cell::Cell::new(0),
+            timestamp_period: 0.0,
+            stats: Vec::new(),
+            history_len: history_frames.max(1),
+            readback_pending: false,
+        }
+    }
+
+    /// Set the timestamp period (nanoseconds per tick) from the adapter.
+    pub fn set_timestamp_period(&mut self, period: f32) {
+        self.timestamp_period = period;
+    }
+
+    /// Enable or disable profiling. When disabled, `begin_pass` returns `None`.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Call at the start of each frame to reset per-frame state.
+    pub fn begin_frame(&self) {
+        self.current_spans.borrow_mut().clear();
+        self.next_slot.set(0);
+    }
+
+    /// Allocate a timestamp pair for a render pass. Returns
+    /// `RenderPassTimestampWrites` to pass into the render pass descriptor.
+    pub fn begin_render_pass(&self, label: &str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        if !self.enabled {
+            return None;
+        }
+        let begin_index = self.next_slot.get();
+        let end_index = begin_index + 1;
+        if end_index >= self.max_passes * 2 {
+            return None; // out of slots
+        }
+        self.next_slot.set(end_index + 1);
+        self.current_spans.borrow_mut().push(GpuTimestampSpan {
+            label: label.to_string(),
+            begin_index,
+            end_index,
+        });
+        Some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.query_sets[self.write_index],
+            beginning_of_pass_write_index: Some(begin_index),
+            end_of_pass_write_index: Some(end_index),
+        })
+    }
+
+    /// Allocate a timestamp pair for a compute pass. Returns
+    /// `ComputePassTimestampWrites` to pass into the compute pass descriptor.
+    pub fn begin_compute_pass(&self, label: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        if !self.enabled {
+            return None;
+        }
+        let begin_index = self.next_slot.get();
+        let end_index = begin_index + 1;
+        if end_index >= self.max_passes * 2 {
+            return None;
+        }
+        self.next_slot.set(end_index + 1);
+        self.current_spans.borrow_mut().push(GpuTimestampSpan {
+            label: label.to_string(),
+            begin_index,
+            end_index,
+        });
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set: &self.query_sets[self.write_index],
+            beginning_of_pass_write_index: Some(begin_index),
+            end_of_pass_write_index: Some(end_index),
+        })
+    }
+
+    /// Resolve the current frame's timestamps into a buffer and copy to the
+    /// readback buffer. Call this *before* `encoder.finish()`.
+    pub fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let slot_count = self.next_slot.get();
+        if !self.enabled || slot_count == 0 {
+            // Swap buffers even if empty so readback stays in sync.
+            self.previous_spans = self.current_spans.borrow().clone();
+            self.current_spans.borrow_mut().clear();
+            self.write_index = 1 - self.write_index;
+            return;
+        }
+
+        let wi = self.write_index;
+        encoder.resolve_query_set(
+            &self.query_sets[wi],
+            0..slot_count,
+            &self.resolve_buffers[wi],
+            0,
+        );
+
+        let byte_count = (slot_count as u64) * std::mem::size_of::<u64>() as u64;
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffers[wi],
+            0,
+            &self.readback_buffers[wi],
+            0,
+            byte_count,
+        );
+
+        self.previous_spans = self.current_spans.borrow().clone();
+        self.current_spans.borrow_mut().clear();
+        self.readback_pending = true;
+        self.write_index = 1 - self.write_index;
+    }
+
+    /// Attempt to read back the *previous* frame's GPU timestamps without
+    /// blocking. Returns `Some(profile)` if data is ready.
+    pub fn read_back(&mut self, device: &wgpu::Device) -> Option<GpuFrameProfile> {
+        if !self.readback_pending || self.previous_spans.is_empty() {
+            return None;
+        }
+
+        // The readback buffer index is the *other* one from current write_index
+        // (since we just swapped in resolve()).
+        let ri = self.write_index; // after swap, this is the one we just wrote to
+
+        let buf = &self.readback_buffers[ri];
+        let slice = buf.slice(..);
+
+        // Non-blocking map: use a channel to signal completion.
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        match rx.recv() {
+            Ok(Ok(())) => {}
+            _ => return None,
+        }
+
+        let data = slice.get_mapped_range();
+        let timestamps: &[u64] = bytemuck::cast_slice(&data[..self.previous_spans.len() * 2 * 8]);
+
+        let period_ms = self.timestamp_period as f64 / 1_000_000.0;
+
+        let mut pass_timings = Vec::with_capacity(self.previous_spans.len());
+        let mut total_gpu_ms = 0.0;
+
+        for span in &self.previous_spans {
+            let begin = timestamps[span.begin_index as usize];
+            let end = timestamps[span.end_index as usize];
+            let duration_ms = if end >= begin {
+                (end - begin) as f64 * period_ms
+            } else {
+                0.0
+            };
+            total_gpu_ms += duration_ms;
+            pass_timings.push(GpuPassTiming {
+                label: span.label.clone(),
+                duration_ms,
+            });
+        }
+
+        // Release the mapped buffer before mutating self for stats.
+        drop(data);
+        buf.unmap();
+        self.readback_pending = false;
+
+        // Update rolling statistics now that the buffer borrow is released.
+        for timing in &pass_timings {
+            self.update_stats(&timing.label, timing.duration_ms);
+        }
+
+        Some(GpuFrameProfile {
+            pass_timings,
+            total_gpu_ms,
+        })
+    }
+
+    fn update_stats(&mut self, label: &str, ms: f64) {
+        if let Some(accum) = self.stats.iter_mut().find(|a| a.label == label) {
+            accum.push(ms);
+        } else {
+            let mut accum = GpuPassStatsAccum::new(label.to_string(), self.history_len);
+            accum.push(ms);
+            self.stats.push(accum);
+        }
+    }
+
+    /// Get rolling statistics for all profiled passes.
+    pub fn pass_stats(&self) -> Vec<GpuPassStats> {
+        self.stats.iter().map(|a| a.stats()).collect()
+    }
+
+    /// Format a human-readable breakdown of the last frame profile.
+    pub fn format_profile(profile: &GpuFrameProfile) -> String {
+        let mut out = String::new();
+        out.push_str("┌─────────────────────────────────────────────┐\n");
+        out.push_str("│           GPU Frame Breakdown               │\n");
+        out.push_str("├──────────────────────────┬──────────────────┤\n");
+        out.push_str("│ Pass                     │ Time (ms)        │\n");
+        out.push_str("├──────────────────────────┼──────────────────┤\n");
+
+        for timing in &profile.pass_timings {
+            out.push_str(&format!(
+                "│ {:<24} │ {:>12.4}     │\n",
+                truncate_str(&timing.label, 24),
+                timing.duration_ms
+            ));
+        }
+
+        out.push_str("├──────────────────────────┼──────────────────┤\n");
+        out.push_str(&format!(
+            "│ {:<24} │ {:>12.4}     │\n",
+            "TOTAL GPU", profile.total_gpu_ms
+        ));
+        out.push_str("└──────────────────────────┴──────────────────┘\n");
+        out
+    }
+
+    /// Format rolling statistics as a table.
+    pub fn format_stats(stats: &[GpuPassStats]) -> String {
+        let mut out = String::new();
+        out.push_str("┌─────────────────────────────────────────────────────────────────────┐\n");
+        out.push_str("│                    GPU Pass Statistics                              │\n");
+        out.push_str("├──────────────────────────┬──────────┬──────────┬──────────┬─────────┤\n");
+        out.push_str("│ Pass                     │ Avg (ms) │ Min (ms) │ Max (ms) │ Last    │\n");
+        out.push_str("├──────────────────────────┼──────────┼──────────┼──────────┼─────────┤\n");
+
+        for s in stats {
+            out.push_str(&format!(
+                "│ {:<24} │ {:>8.4} │ {:>8.4} │ {:>8.4} │ {:>7.4} │\n",
+                truncate_str(&s.label, 24),
+                s.avg_ms,
+                s.min_ms,
+                s.max_ms,
+                s.last_ms,
+            ));
+        }
+
+        out.push_str("└──────────────────────────┴──────────┴──────────┴──────────┴─────────┘\n");
+        out
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max_len - 1])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GPU-resident chunk buffers — configuration for indirect draw and compute
 // visibility culling on the GPU side.
 // ---------------------------------------------------------------------------
@@ -2587,6 +3056,7 @@ impl IndirectDrawPipeline {
     ///
     /// After this, `indirect_draw_buffer` contains the compacted draw commands
     /// and `draw_count_buffer` holds how many were emitted.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_culling(
         &self,
         _device: &wgpu::Device,
@@ -2594,6 +3064,8 @@ impl IndirectDrawPipeline {
         encoder: &mut wgpu::CommandEncoder,
         view_projection: Mat4,
         camera_position: Vec3,
+        lod_timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+        cull_timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         if self.chunk_count == 0 {
             return;
@@ -2638,7 +3110,7 @@ impl IndirectDrawPipeline {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Chunk LOD Selection"),
-                timestamp_writes: None,
+                timestamp_writes: lod_timestamp_writes,
             });
             pass.set_pipeline(&self.lod_pipeline);
             pass.set_bind_group(0, &self.lod_bind_group, &[]);
@@ -2649,7 +3121,7 @@ impl IndirectDrawPipeline {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Visibility Culling"),
-                timestamp_writes: None,
+                timestamp_writes: cull_timestamp_writes,
             });
             pass.set_pipeline(&self.cull_pipeline);
             pass.set_bind_group(0, &self.cull_bind_group, &[]);
@@ -2925,6 +3397,7 @@ pub struct SurfaceRenderer {
     _capabilities: BackendCapabilities,
     deferred: Option<DeferredPipeline>,
     indirect: Option<IndirectDrawPipeline>,
+    gpu_profiler: Option<GpuProfiler>,
 }
 
 impl SurfaceRenderer {
@@ -3059,6 +3532,7 @@ impl SurfaceRenderer {
             _capabilities: backend_capabilities,
             deferred: None,
             indirect: None,
+            gpu_profiler: None,
         })
     }
 
@@ -3120,6 +3594,27 @@ impl SurfaceRenderer {
         Ok(())
     }
 
+    /// Enable GPU timestamp profiling. Requires `Features::TIMESTAMP_QUERY`
+    /// to be available on the adapter. Pass `history_frames` to control
+    /// rolling statistics depth (e.g. 120 for 2 seconds at 60fps).
+    pub fn enable_profiling(&mut self, timestamp_period: f32, history_frames: usize) {
+        let max_passes = 16; // plenty for all pass types
+        let mut profiler = GpuProfiler::new(&self.device, &self.queue, max_passes, history_frames);
+        profiler.set_timestamp_period(timestamp_period);
+        self.gpu_profiler = Some(profiler);
+        log::info!("GPU profiling enabled (period={timestamp_period}ns, history={history_frames})");
+    }
+
+    /// Access the GPU profiler to read statistics.
+    pub fn gpu_profiler(&self) -> Option<&GpuProfiler> {
+        self.gpu_profiler.as_ref()
+    }
+
+    /// Access the GPU profiler mutably (e.g. to call `read_back`).
+    pub fn gpu_profiler_mut(&mut self) -> Option<&mut GpuProfiler> {
+        self.gpu_profiler.as_mut()
+    }
+
     #[profiling::function]
     pub fn render(&mut self, time_seconds: f32) -> std::result::Result<(), wgpu::SurfaceError> {
         self.frame_uniform.time_seconds = time_seconds;
@@ -3149,6 +3644,11 @@ impl SurfaceRenderer {
             );
         }
 
+        // Read back previous frame's GPU timestamps (non-blocking).
+        if let Some(profiler) = &mut self.gpu_profiler {
+            profiler.read_back(&self.device);
+        }
+
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
@@ -3159,9 +3659,17 @@ impl SurfaceRenderer {
                 label: Some("Ferridian Clear Encoder"),
             });
 
+        if let Some(profiler) = &self.gpu_profiler {
+            profiler.begin_frame();
+        }
+
         for scheduled_pass in self.pass_scheduler.passes() {
             match scheduled_pass.kind {
                 RenderPassKind::OpaqueTerrain => {
+                    let ts = self
+                        .gpu_profiler
+                        .as_ref()
+                        .and_then(|p| p.begin_render_pass(scheduled_pass.label));
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(scheduled_pass.label),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3182,7 +3690,7 @@ impl SurfaceRenderer {
                             stencil_ops: None,
                         }),
                         occlusion_query_set: None,
-                        timestamp_writes: None,
+                        timestamp_writes: ts,
                     });
                     pass.set_pipeline(&self.render_pipeline);
                     pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -3192,6 +3700,10 @@ impl SurfaceRenderer {
                 }
                 RenderPassKind::GBufferFill => {
                     if let Some(deferred) = &self.deferred {
+                        let ts = self
+                            .gpu_profiler
+                            .as_ref()
+                            .and_then(|p| p.begin_render_pass(scheduled_pass.label));
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some(scheduled_pass.label),
                             color_attachments: &[
@@ -3234,7 +3746,7 @@ impl SurfaceRenderer {
                                 },
                             ),
                             occlusion_query_set: None,
-                            timestamp_writes: None,
+                            timestamp_writes: ts,
                         });
                         pass.set_pipeline(&deferred.gbuffer_pipeline);
                         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -3261,6 +3773,10 @@ impl SurfaceRenderer {
                             bytemuck::bytes_of(&shadow_uniform),
                         );
 
+                        let ts = self
+                            .gpu_profiler
+                            .as_ref()
+                            .and_then(|p| p.begin_render_pass(scheduled_pass.label));
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some(scheduled_pass.label),
                             color_attachments: &[],
@@ -3275,7 +3791,7 @@ impl SurfaceRenderer {
                                 },
                             ),
                             occlusion_query_set: None,
-                            timestamp_writes: None,
+                            timestamp_writes: ts,
                         });
                         pass.set_pipeline(&deferred.shadow_pipeline);
                         pass.set_bind_group(0, &deferred.shadow_bind_group, &[]);
@@ -3310,6 +3826,10 @@ impl SurfaceRenderer {
                             bytemuck::bytes_of(&lighting_uniform),
                         );
 
+                        let ts = self
+                            .gpu_profiler
+                            .as_ref()
+                            .and_then(|p| p.begin_render_pass(scheduled_pass.label));
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some(scheduled_pass.label),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3323,7 +3843,7 @@ impl SurfaceRenderer {
                             })],
                             depth_stencil_attachment: None,
                             occlusion_query_set: None,
-                            timestamp_writes: None,
+                            timestamp_writes: ts,
                         });
                         pass.set_pipeline(&deferred.lighting_pipeline);
                         pass.set_bind_group(0, &deferred.lighting_bind_group, &[]);
@@ -3333,6 +3853,10 @@ impl SurfaceRenderer {
                 }
                 RenderPassKind::Translucent => {
                     if let Some(deferred) = &self.deferred {
+                        let ts = self
+                            .gpu_profiler
+                            .as_ref()
+                            .and_then(|p| p.begin_render_pass(scheduled_pass.label));
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some(scheduled_pass.label),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3355,7 +3879,7 @@ impl SurfaceRenderer {
                                 },
                             ),
                             occlusion_query_set: None,
-                            timestamp_writes: None,
+                            timestamp_writes: ts,
                         });
                         pass.set_pipeline(&deferred.translucent_pipeline);
                         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -3373,16 +3897,30 @@ impl SurfaceRenderer {
                         let aspect = aspect_ratio(self.config.width, self.config.height);
                         let vp = camera.view_projection_matrix(aspect);
                         let cam_eye = camera.eye();
+                        let (lod_ts, cull_ts) = match self.gpu_profiler.as_ref() {
+                            Some(p) => {
+                                let l = p.begin_compute_pass("LOD Selection");
+                                let c = p.begin_compute_pass("Visibility Culling");
+                                (l, c)
+                            }
+                            None => (None, None),
+                        };
                         indirect.dispatch_culling(
                             &self.device,
                             &self.queue,
                             &mut encoder,
                             vp,
                             cam_eye,
+                            lod_ts,
+                            cull_ts,
                         );
                     }
                 }
             }
+        }
+
+        if let Some(profiler) = &mut self.gpu_profiler {
+            profiler.resolve(&mut encoder);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
