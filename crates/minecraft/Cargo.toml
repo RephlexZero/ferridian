@@ -1,0 +1,10 @@
+[package]
+name = "ferridian-minecraft"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ferridian-core = { path = "../core" }
+ferridian-shader = { path = "../shader" }

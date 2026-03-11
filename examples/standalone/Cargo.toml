@@ -1,0 +1,13 @@
+[package]
+name = "ferridian-standalone"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ferridian-core = { path = "../../crates/core" }
+pollster.workspace = true
+wgpu.workspace = true
+winit.workspace = true

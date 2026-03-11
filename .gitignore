@@ -1,0 +1,7 @@
+/target
+/.gradle
+/java/.gradle
+/java/build
+/.devcontainer/.cache
+/.DS_Store
+*.iml

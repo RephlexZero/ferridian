@@ -1,0 +1,34 @@
+{
+    "name": "ferridian",
+    "build": {
+        "context": "..",
+        "dockerfile": "Dockerfile"
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/java:1": {
+            "installGradle": true,
+            "version": "21"
+        },
+        "ghcr.io/devcontainers/features/rust:1": {
+            "profile": "default",
+            "version": "stable"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "vadimcn.vscode-lldb",
+                "vscjava.vscode-java-pack",
+                "tamasfe.even-better-toml"
+            ],
+            "settings": {
+                "editor.formatOnSave": true,
+                "java.compile.nullAnalysis.mode": "automatic",
+                "rust-analyzer.check.command": "clippy"
+            }
+        }
+    },
+    "postCreateCommand": "cargo run -p xtask -- hooks && rustup component add clippy rustfmt",
+    "remoteUser": "vscode"
+}

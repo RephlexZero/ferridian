@@ -1,0 +1,13 @@
+[package]
+name = "ferridian-core"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+ferridian-utils = { path = "../utils" }
+glam.workspace = true
+wgpu.workspace = true
