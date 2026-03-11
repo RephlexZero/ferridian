@@ -52,7 +52,12 @@
     // -----------------------------------------------------------------------
     "containerEnv": {
         "DISPLAY": "${localEnv:DISPLAY}",
-        "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY}",
+        // Force winit to use X11 inside the container. There is no Wayland
+        // compositor running inside a devcontainer, so letting winit auto-
+        // detect would cause it to find a host WAYLAND_DISPLAY socket it
+        // cannot actually talk to and fail with "Could not find wayland compositor".
+        "WINIT_UNIX_BACKEND": "x11",
+        "WAYLAND_DISPLAY": "",
         "XDG_RUNTIME_DIR": "/tmp/runtime-dir",
         "NVIDIA_VISIBLE_DEVICES": "all",
         "NVIDIA_DRIVER_CAPABILITIES": "graphics,utility,compute"
