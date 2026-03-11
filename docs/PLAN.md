@@ -200,6 +200,83 @@ As much as possible, all work should be test driven.
 - [x] Add ReSTIR-style direct lighting as an optional high-quality mode
 - [ ] Profile and optimize SPIR-V output vs hand-written WGSL for critical passes
 
+## Phase 15: Fabric mod packaging and first in-game boot
+
+The renderer core works standalone. This phase closes the gap to an actual
+loadable Fabric mod that boots inside a real Minecraft instance.
+
+- [ ] Add `fabric.mod.json` with correct entry points, dependencies, and schema version
+- [ ] Add a `FerridianModInitializer` that implements `ModInitializer` and boots the native library early in the Fabric lifecycle
+- [ ] Implement native library extraction: embed the platform `.so`/`.dll`/`.dylib` inside the JAR as a resource and unpack it to a temp directory on first boot
+- [ ] Choose and verify the native extraction path works on Windows, macOS, and Linux without requiring the user to set `java.library.path` manually
+- [ ] Add a Gradle task that copies the Rust release artifact into `java/src/main/resources/natives/<platform>/` as part of `gradle build`
+- [ ] Add `FerridianMixins.java` entry point and a `mixins.ferridian.json` descriptor to hook into Minecraft's render lifecycle
+- [ ] Write a mixin for `GameRenderer#render` to intercept the per-frame call and hand off to the JNI bridge
+- [ ] Write a mixin that fires on window resize and calls `RendererBridge.resize`
+- [ ] Write a mixin that fires on world load/unload to manage renderer lifetime
+- [ ] Validate the mod loads without crashing in a Fabric dev environment using Loom and a real MC jar
+- [ ] Add a Loom-based `runClient` Gradle task so `./gradlew runClient` launches Minecraft with the mod
+
+## Phase 16: Live chunk and scene data pipeline
+
+Booting the mod is insufficient without actual Minecraft scene data feeding the renderer.
+
+- [ ] Read real chunk section data out of Minecraft's `ChunkSection` and `BlockState` via mixin or FRAPI
+- [ ] Serialize chunk section geometry into the binary layout expected by `IndirectDrawPipeline::upload_chunks`
+- [ ] Upload newly meshed chunks over JNI using the existing zero-copy `DirectByteBuffer` path
+- [ ] Evict chunks on unload and update the GPU-resident chunk buffer accordingly
+- [ ] Extract the real camera eye/target/fov from `GameRenderer` each frame and write into the frame snapshot buffer
+- [ ] Extract the real sun direction from `DimensionType` sky angle and pass it into `LightingUniform`
+- [ ] Feed real game time into `tint_and_time.w` for wave animation and other time-driven effects
+- [ ] Suppress Minecraft's own chunk rendering for sections Ferridian has taken ownership of
+- [ ] Pass block-light and sky-light level maps for lit sections into the deferred lighting pass
+- [ ] Render entity and particle layers through the translucent path if possible, otherwise composite Minecraft's entity output on top
+- [ ] Validate the deferred output looks correct in an actual Minecraft world (not just the demo chunk scene)
+
+## Phase 17: Resource pack and texture integration
+
+- [ ] Load the active resource pack's block textures into the renderer's texture-array at world load time
+- [ ] Map Minecraft `ResourceLocation` → texture array index so the G-buffer shader can sample the right tile
+- [ ] Support animated textures (lava, water, portals) by updating the texture array every frame for animated tiles
+- [ ] Parse LabPBR normals/speculars from resource pack if present and write into material G-buffer channels
+- [ ] Handle resource reload (`onResourceReload`) by re-uploading the texture array and invalidating the shader permutation cache
+- [ ] Expose a config screen (Mod Menu integration) for render distance, quality tier, and shadow cascade count
+
+## Phase 18: Vulkan-native readiness
+
+Mojang is transitioning Minecraft to a Vulkan-native renderer. This phase
+ensures Ferridian is positioned to survive and benefit from that transition
+rather than becoming a liability. The key principle: own the surface, share
+the device if possible, never depend on an OpenGL context existing.
+
+- [ ] Audit every code path for any implicit assumption that an OpenGL context or LWJGL window exists; remove or gate all such assumptions now
+- [ ] Separate surface acquisition from renderer initialization so `SurfaceRenderer` can accept either a raw window handle (current) or a `VkSurfaceKHR` handed to us by Minecraft's future Vulkan layer
+- [ ] Add a `SurfaceRenderer::from_vulkan_surface(instance, surface, physical_device)` constructor path that skips wgpu instance creation and wraps an externally-provided Vulkan context using `wgpu::Instance::from_hal`
+- [ ] Implement a `SharedVulkanDevice` adapter so Ferridian can share a `VkDevice` with Minecraft's renderer rather than competing for a second device on the same GPU — avoids VRAM doubling on integrated and low-VRAM discrete GPUs
+- [ ] Gate all `wgpu::Features::SPIRV_SHADER_PASSTHROUGH` and Vulkan-specific extension usage behind capability checks so the renderer degrades gracefully on Metal and DX12
+- [ ] Track `VK_EXT_mesh_shader` and `VK_KHR_ray_query` availability via `BackendCapabilities` and gate Phase 14 high-end passes behind those caps at runtime, not compile time
+- [ ] Keep the wgpu adapter selection logic aware that Minecraft's Vulkan renderer may have already enumerated and opened the physical device — add a device-reuse probe path
+- [ ] Validate the renderer builds and runs on Vulkan, Metal, and DX12 backends in CI with a headless wgpu device to catch backend-specific regressions early
+- [ ] Add a `RenderTarget::ExternalSwapchain` variant so, when Minecraft owns the swapchain, Ferridian writes into textures Minecraft composites rather than presenting independently
+- [ ] Watch Mojang's snapshot release notes and the Aperture spec for the first public `VkInstance`/`VkDevice` handoff API and adapt the JNI boundary to accept it as soon as it appears
+- [ ] Write a migration note in `docs/WGPU_COMPATIBILITY.md` documenting the planned path from LWJGL window handle → Minecraft-provided Vulkan surface → Aperture pipeline ownership
+
+## Definition of "shipped in-game"
+
+- [ ] The Fabric mod JAR loads in a real Minecraft Fabric instance without crashing
+- [ ] Real chunk geometry from a Minecraft world renders through the deferred pipeline
+- [ ] The player can move the camera and see correct depth, lighting, and shadows
+- [ ] Resource pack block textures appear on terrain rather than the demo solid colours
+- [ ] Performance on a mid-range GPU is at least competitive with vanilla at equivalent render distance
+
+## Definition of "Vulkan-transition ready"
+
+- [ ] No OpenGL or LWJGL assumptions anywhere in the Rust codebase
+- [ ] `SurfaceRenderer` can be initialised from an externally-provided Vulkan surface
+- [ ] Device sharing path exists and is tested with a headless Vulkan device
+- [ ] All Vulkan-specific features are capability-gated, not hard-required
+- [ ] The JNI boundary has a documented and implemented path for receiving a `VkInstance` handle
+
 ## Learning and research backlog
 
 - [x] Study `wgpu-mc` for JNI and Minecraft renderer ownership patterns
