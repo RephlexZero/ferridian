@@ -49,14 +49,14 @@ As much as possible, all work should be test driven.
 - [x] Create a JNI bridge crate stub that compiles cleanly as a `cdylib`
 - [x] Add native library loading from the Java side
 - [x] Expose a minimal end-to-end JNI ping from Java into Rust
-- [ ] Define the first stable bridge API for renderer init, resize, and frame execution
+- [x] Define the first stable bridge API for renderer init, resize, and frame execution
 - [ ] Move bulk data exchange to direct buffers rather than per-call copies
 - [ ] Unify the standalone renderer entry path and JNI renderer entry path
 
 ## Minecraft adapter layer
 
 - [x] Reserve a dedicated `ferridian-minecraft` crate for game-facing adaptation
-- [ ] Define chunk, camera, and frame input types for Minecraft-facing data
+- [x] Define chunk, camera, and frame input types for Minecraft-facing data
 - [ ] Add a Fabric-side loader or hook shell in the Java project
 - [ ] Connect the Java side to real Minecraft lifecycle or render hooks
 - [ ] Feed Minecraft scene state into Rust without direct renderer ownership on the Java side
