@@ -2,6 +2,8 @@
 
 Ferridian is a scaffold for a Rust-first Minecraft shader engine built around a wgpu renderer, a JNI bridge, and a Java integration shell that can evolve alongside Minecraft Java Edition's Vulkan transition.
 
+The repository is dual-licensed under MIT or Apache-2.0.
+
 Core repository docs live under `docs/`:
 
 - `docs/ARCHITECTURE.md`
@@ -33,4 +35,4 @@ cargo run -p ferridian-standalone
 
 The pre-commit hook runs the same `xtask ci` command as GitHub Actions so local failures match CI failures as closely as possible.
 
-The standalone example is the first runnable renderer slice: it opens a desktop window and exercises the current Rust-side wgpu bootstrap with an animated triangle pipeline before depending on Minecraft integration.
+The standalone example is the first runnable renderer slice: it opens a desktop window and exercises the current Rust-side wgpu bootstrap with a camera-driven indexed voxel chunk before depending on Minecraft integration.

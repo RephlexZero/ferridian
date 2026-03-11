@@ -21,7 +21,7 @@ As much as possible, all work should be test driven.
 - [x] Add CI that runs the shared workspace automation command
 - [x] Add versioned git hooks that use the same automation path as CI
 - [x] Centralize shared Rust dependencies in `[workspace.dependencies]`
-- [ ] Add dual-license files to the repository root
+- [x] Add dual-license files to the repository root
 - [ ] Add release packaging and native artifact publishing flow
 
 ## Current runnable slice
@@ -30,16 +30,16 @@ As much as possible, all work should be test driven.
 - [x] Add a standalone runnable example outside Minecraft integration
 - [x] Render an animated WGSL triangle through the standalone example
 - [x] Keep example bootstrapping thin and push renderer ownership into `ferridian-core`
-- [ ] Add a camera abstraction usable by both standalone and future Minecraft entry points
-- [ ] Replace the triangle slice with reusable mesh and material primitives
-- [ ] Add depth buffering and basic transform handling
+- [x] Add a camera abstraction usable by both standalone and future Minecraft entry points
+- [x] Replace the triangle slice with reusable mesh and material primitives
+- [x] Add depth buffering and basic transform handling
 
 ## Shader pipeline foundation
 
 - [x] Establish WGSL as the first live shader path
-- [ ] Add shader module loading from disk instead of `include_str!`
+- [x] Add shader module loading from disk instead of `include_str!`
 - [ ] Add hot reload support for local standalone development
-- [ ] Add shader reflection or manifest metadata for pipeline setup
+- [x] Add shader reflection or manifest metadata for pipeline setup
 - [ ] Introduce GLSL ingestion for compatibility and migration tooling
 - [ ] Evaluate `naga`, `shaderc`, and `rspirv` responsibilities in code rather than only in docs
 
@@ -47,8 +47,8 @@ As much as possible, all work should be test driven.
 
 - [x] Create a Java bootstrap shell with tests
 - [x] Create a JNI bridge crate stub that compiles cleanly as a `cdylib`
-- [ ] Add native library loading from the Java side
-- [ ] Expose a minimal end-to-end JNI ping from Java into Rust
+- [x] Add native library loading from the Java side
+- [x] Expose a minimal end-to-end JNI ping from Java into Rust
 - [ ] Define the first stable bridge API for renderer init, resize, and frame execution
 - [ ] Move bulk data exchange to direct buffers rather than per-call copies
 - [ ] Unify the standalone renderer entry path and JNI renderer entry path
@@ -68,16 +68,16 @@ As much as possible, all work should be test driven.
 
 - [x] Clear the swapchain successfully
 - [x] Render a simple animated triangle
-- [ ] Render indexed geometry with a reusable vertex format
-- [ ] Add a camera uniform and basic view/projection control
-- [ ] Load one external shader asset through the shader crate
-- [ ] Render a simple voxel chunk or cube grid in the standalone example
+- [x] Render indexed geometry with a reusable vertex format
+- [x] Add a camera uniform and basic view/projection control
+- [x] Load one external shader asset through the shader crate
+- [x] Render a simple voxel chunk or cube grid in the standalone example
 
 ### Phase 2: Forward rendering baseline
 
 - [ ] Add texture loading and sampler management
-- [ ] Add a depth buffer and deterministic resize handling for all attachments
-- [ ] Add simple directional lighting
+- [x] Add a depth buffer and deterministic resize handling for all attachments
+- [x] Add simple directional lighting
 - [ ] Add material definitions that can evolve toward PBR
 - [ ] Add a basic render graph or pass scheduler in `ferridian-core`
 
@@ -133,17 +133,17 @@ As much as possible, all work should be test driven.
 
 - [x] The repo scaffolds cleanly and validates through shared automation
 - [x] There is a standalone runnable renderer slice outside Minecraft
-- [ ] The standalone slice renders chunk-like geometry rather than only a demo primitive
-- [ ] Java can successfully call into Rust over JNI
+- [x] The standalone slice renders chunk-like geometry rather than only a demo primitive
+- [x] Java can successfully call into Rust over JNI
 - [ ] A single renderer path can be driven either from standalone or from the Java shell
 
 ## Definition of “feature complete enough to chase Minecraft integration”
 
 - [ ] Camera, mesh, shader, and texture primitives are reusable from `ferridian-core`
 - [ ] The shader crate owns real loading/translation responsibilities
-- [ ] The JNI boundary is real, not stubbed
-- [ ] The Java shell can load and call the native library
-- [ ] The standalone path can render a simple voxel scene with depth and basic lighting
+- [x] The JNI boundary is real, not stubbed
+- [x] The Java shell can load and call the native library
+- [x] The standalone path can render a simple voxel scene with depth and basic lighting
 
 ## Definition of “feature complete enough to chase shader-pack parity”
 

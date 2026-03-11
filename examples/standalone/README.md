@@ -4,7 +4,7 @@ This directory contains renderer slices that can run without the Minecraft adapt
 
 ## First slice
 
-The initial standalone binary opens a native window, initializes wgpu through `ferridian-core`, and renders an animated triangle pipeline.
+The initial standalone binary opens a native window, initializes wgpu through `ferridian-core`, loads a WGSL shader from disk, and renders a small indexed voxel chunk with a moving camera and depth buffering.
 
 ```bash
 cargo run -p ferridian-standalone

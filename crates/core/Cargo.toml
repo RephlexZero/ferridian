@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytemuck.workspace = true
+ferridian-shader = { path = "../shader" }
 ferridian-utils = { path = "../utils" }
 glam.workspace = true
 wgpu.workspace = true

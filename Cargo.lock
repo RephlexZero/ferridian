@@ -511,6 +511,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "ferridian-shader",
  "ferridian-utils",
  "glam",
  "wgpu",
@@ -535,6 +536,7 @@ dependencies = [
 name = "ferridian-shader"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde",
  "wgpu",
 ]
