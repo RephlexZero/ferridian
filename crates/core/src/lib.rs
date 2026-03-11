@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
-use ferridian_shader::{ShaderAsset, ShaderPipelineMetadata};
+use ferridian_shader::{ShaderAsset, ShaderPipelineMetadata, SpirvModule};
 use ferridian_utils::WorkspaceMetadata;
 use glam::{Mat4, Quat, Vec3};
 use rayon::prelude::*;
@@ -105,6 +105,38 @@ impl BackendCapabilities {
             adapter_name: info.name.clone(),
             backend: info.backend,
             features: adapter.features(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shader backend selection — SPIR-V primary, WGSL fallback.
+// ---------------------------------------------------------------------------
+
+/// Selects which shader source format the renderer uses for pipeline creation.
+/// SPIR-V is preferred when a pre-compiled `.spv` module is available and the
+/// backend supports the `spirv` feature.  WGSL is the universal fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShaderBackend {
+    /// Use pre-compiled Rust-GPU SPIR-V modules as the primary shader path.
+    SpirV,
+    /// Use hand-written WGSL shaders (universal fallback).
+    #[default]
+    Wgsl,
+}
+
+impl ShaderBackend {
+    /// Attempt to select SPIR-V if the module exists on disk; fall back to WGSL.
+    pub fn detect() -> Self {
+        match SpirvModule::load_default() {
+            Ok(_) => {
+                log::info!("SPIR-V shader module found — using SpirV backend");
+                Self::SpirV
+            }
+            Err(_) => {
+                log::info!("SPIR-V module not available — falling back to WGSL backend");
+                Self::Wgsl
+            }
         }
     }
 }
@@ -375,6 +407,655 @@ impl GBufferTargets {
             view_formats: &[],
         });
         texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deferred pipeline — holds GPU resources for G-buffer fill, deferred lighting,
+// shadow mapping, and translucent passes.
+// ---------------------------------------------------------------------------
+
+/// Uniform uploaded for the deferred lighting fullscreen pass.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct LightingUniform {
+    pub light_direction: [f32; 4],
+    pub light_color: [f32; 4],
+    pub camera_position: [f32; 4],
+    pub inv_view_projection: [[f32; 4]; 4],
+    pub shadow_view_projection: [[f32; 4]; 4],
+    pub ambient_color: [f32; 4],
+}
+
+/// Uniform uploaded for the shadow depth pass.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct ShadowPassUniform {
+    pub light_view_projection: [[f32; 4]; 4],
+    pub model: [[f32; 4]; 4],
+}
+
+/// Holds all GPU resources for the deferred rendering pipeline.
+pub struct DeferredPipeline {
+    pub gbuffer_targets: GBufferTargets,
+    pub gbuffer_pipeline: wgpu::RenderPipeline,
+    pub lighting_pipeline: wgpu::RenderPipeline,
+    pub lighting_bind_group_layout: wgpu::BindGroupLayout,
+    pub lighting_bind_group: wgpu::BindGroup,
+    pub lighting_uniform_buffer: wgpu::Buffer,
+    pub lighting_data_bind_group_layout: wgpu::BindGroupLayout,
+    pub lighting_data_bind_group: wgpu::BindGroup,
+    pub gbuffer_sampler: wgpu::Sampler,
+    pub shadow_pipeline: wgpu::RenderPipeline,
+    pub shadow_depth_texture: wgpu::Texture,
+    pub shadow_depth_view: wgpu::TextureView,
+    pub shadow_uniform_buffer: wgpu::Buffer,
+    pub shadow_bind_group_layout: wgpu::BindGroupLayout,
+    pub shadow_bind_group: wgpu::BindGroup,
+    pub shadow_config: ShadowCascadeConfig,
+    pub translucent_pipeline: wgpu::RenderPipeline,
+    pub shader_backend: ShaderBackend,
+}
+
+/// Helper: create a wgpu `ShaderModule` from a SPIR-V module.
+///
+/// # Safety
+/// The caller must ensure the SPIR-V bytecode is valid and trusted.
+unsafe fn create_spirv_module(device: &wgpu::Device, spirv: &SpirvModule) -> wgpu::ShaderModule {
+    unsafe { spirv.create_module(device) }
+}
+
+impl DeferredPipeline {
+    pub fn new(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        scene_bind_group_layout: &wgpu::BindGroupLayout,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        Self::with_shader_backend(
+            device,
+            surface_format,
+            scene_bind_group_layout,
+            width,
+            height,
+            ShaderBackend::Wgsl,
+        )
+    }
+
+    pub fn with_shader_backend(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        scene_bind_group_layout: &wgpu::BindGroupLayout,
+        width: u32,
+        height: u32,
+        shader_backend: ShaderBackend,
+    ) -> Result<Self> {
+        let layout = GBufferLayout::default();
+        let gbuffer_targets = GBufferTargets::new(device, width, height, &layout);
+        let shadow_config = ShadowCascadeConfig::default();
+
+        // --- Load shaders ---
+        // When SPIR-V backend is selected, load the pre-compiled Rust-GPU module.
+        // All entry points (gbuffer_fill_vs/fs, shadow_vs/fs, deferred_lighting_vs/fs,
+        // translucent_vs/fs) live in a single .spv file.
+        let spirv_module = if shader_backend == ShaderBackend::SpirV {
+            match SpirvModule::load_default() {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    log::warn!("Failed to load SPIR-V module, falling back to WGSL: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Effective backend after fallback
+        let effective_backend = if spirv_module.is_some() {
+            ShaderBackend::SpirV
+        } else {
+            ShaderBackend::Wgsl
+        };
+
+        let gbuffer_shader = ShaderAsset::load_workspace_wgsl(
+            "shaders/wgsl/gbuffer_fill.wgsl",
+            ShaderPipelineMetadata {
+                label: "Ferridian G-Buffer Fill".to_string(),
+                vertex_entry: "vs_main".to_string(),
+                fragment_entry: "fs_main".to_string(),
+                requires_depth: true,
+            },
+        )?;
+        let lighting_shader = ShaderAsset::load_workspace_wgsl(
+            "shaders/wgsl/deferred_lighting.wgsl",
+            ShaderPipelineMetadata {
+                label: "Ferridian Deferred Lighting".to_string(),
+                vertex_entry: "vs_main".to_string(),
+                fragment_entry: "fs_main".to_string(),
+                requires_depth: false,
+            },
+        )?;
+        let shadow_shader = ShaderAsset::load_workspace_wgsl(
+            "shaders/wgsl/shadow_depth.wgsl",
+            ShaderPipelineMetadata {
+                label: "Ferridian Shadow Depth".to_string(),
+                vertex_entry: "vs_main".to_string(),
+                fragment_entry: String::new(),
+                requires_depth: true,
+            },
+        )?;
+        let translucent_shader = ShaderAsset::load_workspace_wgsl(
+            "shaders/wgsl/translucent.wgsl",
+            ShaderPipelineMetadata {
+                label: "Ferridian Translucent".to_string(),
+                vertex_entry: "vs_main".to_string(),
+                fragment_entry: "fs_main".to_string(),
+                requires_depth: true,
+            },
+        )?;
+
+        // --- Shadow map ---
+        let shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Shadow Depth Texture"),
+            size: wgpu::Extent3d {
+                width: shadow_config.resolution,
+                height: shadow_config.resolution,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: shadow_config.depth_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_depth_view =
+            shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let shadow_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Shadow Uniform Buffer"),
+            contents: bytemuck::bytes_of(&ShadowPassUniform {
+                light_view_projection: Mat4::IDENTITY.to_cols_array_2d(),
+                model: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let shadow_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Shadow Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shadow Bind Group"),
+            layout: &shadow_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: shadow_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Shadow Pipeline Layout"),
+                bind_group_layouts: &[&shadow_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let shadow_module = if let Some(ref spirv) = spirv_module {
+            // SAFETY: SPIR-V module was validated at load time by SpirvModule::from_bytes.
+            unsafe { create_spirv_module(device, spirv) }
+        } else {
+            shadow_shader.create_module(device)
+        };
+        let shadow_vs_entry = if effective_backend == ShaderBackend::SpirV {
+            "shadow_vs"
+        } else {
+            "vs_main"
+        };
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow Pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_module,
+                entry_point: Some(shadow_vs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[MeshVertex::layout()],
+            },
+            fragment: None, // depth-only
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Front), // front-face culling for shadow bias
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: shadow_config.depth_format,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 1.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // --- G-buffer fill pipeline ---
+        let gbuffer_module = if let Some(ref spirv) = spirv_module {
+            unsafe { create_spirv_module(device, spirv) }
+        } else {
+            gbuffer_shader.create_module(device)
+        };
+        let (gbuf_vs_entry, gbuf_fs_entry) = if effective_backend == ShaderBackend::SpirV {
+            ("gbuffer_fill_vs", "gbuffer_fill_fs")
+        } else {
+            ("vs_main", "fs_main")
+        };
+        let gbuffer_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("G-Buffer Pipeline Layout"),
+                bind_group_layouts: &[scene_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let gbuffer_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("G-Buffer Fill Pipeline"),
+            layout: Some(&gbuffer_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &gbuffer_module,
+                entry_point: Some(gbuf_vs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[MeshVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &gbuffer_module,
+                entry_point: Some(gbuf_fs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: layout.albedo_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: layout.normal_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: layout.material_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: layout.depth_format,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // --- Deferred lighting pipeline ---
+        let gbuffer_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("G-Buffer Sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let shadow_comparison_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Shadow Comparison Sampler"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let lighting_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Lighting Textures Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                ],
+            });
+
+        let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lighting Textures Bind Group"),
+            layout: &lighting_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&gbuffer_targets.albedo_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&gbuffer_targets.normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&gbuffer_targets.material_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&gbuffer_targets.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&gbuffer_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&shadow_comparison_sampler),
+                },
+            ],
+        });
+
+        let lighting_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Lighting Uniform Buffer"),
+                contents: bytemuck::bytes_of(&LightingUniform {
+                    light_direction: [0.35, 0.8, 0.28, 0.0],
+                    light_color: [1.0, 0.95, 0.9, 1.0],
+                    camera_position: [0.0; 4],
+                    inv_view_projection: Mat4::IDENTITY.to_cols_array_2d(),
+                    shadow_view_projection: Mat4::IDENTITY.to_cols_array_2d(),
+                    ambient_color: [0.15, 0.17, 0.2, 1.0],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let lighting_data_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Lighting Data Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let lighting_data_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lighting Data Bind Group"),
+            layout: &lighting_data_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lighting_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let lighting_module = if let Some(ref spirv) = spirv_module {
+            unsafe { create_spirv_module(device, spirv) }
+        } else {
+            lighting_shader.create_module(device)
+        };
+        let (light_vs_entry, light_fs_entry) = if effective_backend == ShaderBackend::SpirV {
+            ("deferred_lighting_vs", "deferred_lighting_fs")
+        } else {
+            ("vs_main", "fs_main")
+        };
+        let lighting_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Lighting Pipeline Layout"),
+                bind_group_layouts: &[
+                    &lighting_bind_group_layout,
+                    &lighting_data_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+        let lighting_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Deferred Lighting Pipeline"),
+            layout: Some(&lighting_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &lighting_module,
+                entry_point: Some(light_vs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[], // fullscreen triangle from vertex_index
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &lighting_module,
+                entry_point: Some(light_fs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // --- Translucent pipeline ---
+        let translucent_module = if let Some(ref spirv) = spirv_module {
+            unsafe { create_spirv_module(device, spirv) }
+        } else {
+            translucent_shader.create_module(device)
+        };
+        let (trans_vs_entry, trans_fs_entry) = if effective_backend == ShaderBackend::SpirV {
+            ("translucent_vs", "translucent_fs")
+        } else {
+            ("vs_main", "fs_main")
+        };
+        let translucent_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Translucent Pipeline Layout"),
+                bind_group_layouts: &[scene_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let translucent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Translucent Pipeline"),
+            layout: Some(&translucent_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &translucent_module,
+                entry_point: Some(trans_vs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[MeshVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &translucent_module,
+                entry_point: Some(trans_fs_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: layout.depth_format,
+                depth_write_enabled: false, // translucent doesn't write depth
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Ok(Self {
+            gbuffer_targets,
+            gbuffer_pipeline,
+            lighting_pipeline,
+            lighting_bind_group_layout,
+            lighting_bind_group,
+            lighting_uniform_buffer,
+            lighting_data_bind_group_layout,
+            lighting_data_bind_group,
+            gbuffer_sampler,
+            shadow_pipeline,
+            shadow_depth_texture,
+            shadow_depth_view,
+            shadow_uniform_buffer,
+            shadow_bind_group_layout,
+            shadow_bind_group,
+            shadow_config,
+            translucent_pipeline,
+            shader_backend: effective_backend,
+        })
+    }
+
+    /// Compute the light view-projection matrix for shadow mapping.
+    pub fn compute_light_vp(sun_direction: Vec3, scene_center: Vec3, extent: f32) -> Mat4 {
+        let light_pos = scene_center + sun_direction.normalize() * extent;
+        let light_view = Mat4::look_at_rh(light_pos, scene_center, Vec3::Y);
+        let light_proj = Mat4::orthographic_rh(-extent, extent, -extent, extent, 0.1, extent * 2.5);
+        light_proj * light_view
+    }
+
+    /// Resize the G-buffer targets and recreate bind groups that reference them.
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let layout = GBufferLayout::default();
+        self.gbuffer_targets = GBufferTargets::new(device, width, height, &layout);
+
+        // Recreate the lighting bind group to reference new texture views
+        let shadow_comparison_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Shadow Comparison Sampler"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        self.lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lighting Textures Bind Group"),
+            layout: &self.lighting_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.gbuffer_targets.albedo_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.gbuffer_targets.normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.gbuffer_targets.material_view,
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.gbuffer_targets.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.shadow_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.gbuffer_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&shadow_comparison_sampler),
+                },
+            ],
+        });
     }
 }
 
@@ -750,6 +1431,8 @@ pub enum RenderPassKind {
     DeferredLighting,
     Translucent,
     ShadowMap,
+    /// GPU-driven compute: LOD selection + frustum/occlusion culling → indirect draw buffer.
+    ComputeCull,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -800,6 +1483,45 @@ impl PassScheduler {
     /// A full deferred pipeline with shadow maps up front.
     pub fn deferred_with_shadows(cascade_count: u32) -> Self {
         let mut passes = Vec::with_capacity(3 + cascade_count as usize);
+        for i in 0..cascade_count {
+            passes.push(ScheduledPass {
+                kind: RenderPassKind::ShadowMap,
+                label: if i == 0 {
+                    "Ferridian Shadow Cascade 0"
+                } else if i == 1 {
+                    "Ferridian Shadow Cascade 1"
+                } else {
+                    "Ferridian Shadow Cascade N"
+                },
+            });
+        }
+        passes.push(ScheduledPass {
+            kind: RenderPassKind::GBufferFill,
+            label: "Ferridian G-Buffer Fill Pass",
+        });
+        passes.push(ScheduledPass {
+            kind: RenderPassKind::DeferredLighting,
+            label: "Ferridian Deferred Lighting Pass",
+        });
+        passes.push(ScheduledPass {
+            kind: RenderPassKind::Translucent,
+            label: "Ferridian Translucent Pass",
+        });
+        Self { passes }
+    }
+
+    /// GPU-driven indirect rendering pipeline with compute culling.
+    /// 1. Compute cull — LOD selection + frustum/occlusion → indirect draw buffer
+    /// 2. Shadow map passes
+    /// 3. G-buffer fill using indirect draws
+    /// 4. Deferred lighting
+    /// 5. Translucent (still direct for alpha-sorted geometry)
+    pub fn gpu_indirect(cascade_count: u32) -> Self {
+        let mut passes = Vec::with_capacity(4 + cascade_count as usize);
+        passes.push(ScheduledPass {
+            kind: RenderPassKind::ComputeCull,
+            label: "Ferridian Compute Cull",
+        });
         for i in 0..cascade_count {
             passes.push(ScheduledPass {
                 kind: RenderPassKind::ShadowMap,
@@ -1224,6 +1946,728 @@ impl Default for VisibilityCullConfig {
 }
 
 // ---------------------------------------------------------------------------
+// GPU-driven indirect rendering pipeline — compute-based visibility culling,
+// Hi-Z occlusion, and chunk LOD selection that replaces per-chunk CPU draw
+// calls with a single multi-draw-indirect dispatch.
+// ---------------------------------------------------------------------------
+
+/// Uniform data for the frustum/occlusion culling compute shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct CullUniforms {
+    pub view_projection: [[f32; 4]; 4],
+    pub frustum_planes: [[f32; 4]; 6],
+    pub chunk_count: u32,
+    pub enable_occlusion: u32,
+    pub hiz_width: f32,
+    pub hiz_height: f32,
+}
+
+/// Uniform data for the chunk LOD selection compute shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct LodUniforms {
+    pub camera_position: [f32; 4],
+    pub lod_distances: [f32; 4],
+    pub chunk_count: u32,
+    pub max_lod: u32,
+    pub _pad: [u32; 2],
+}
+
+/// Configuration for chunk LOD distance thresholds.
+#[derive(Clone, Debug)]
+pub struct ChunkLodConfig {
+    /// Distance thresholds for LOD levels 0–3.
+    pub distances: [f32; 4],
+    /// Maximum LOD level (chunks beyond distance[max_lod] are culled).
+    pub max_lod: u32,
+}
+
+impl Default for ChunkLodConfig {
+    fn default() -> Self {
+        Self {
+            distances: [64.0, 128.0, 256.0, 512.0],
+            max_lod: 3,
+        }
+    }
+}
+
+/// Extract six frustum planes from a view-projection matrix.
+/// Each plane is `[nx, ny, nz, d]` such that `dot(normal, point) + d >= 0` for
+/// points inside the frustum.
+pub fn extract_frustum_planes(vp: &Mat4) -> [[f32; 4]; 6] {
+    let m = vp.to_cols_array_2d();
+    let row = |r: usize| -> [f32; 4] { [m[0][r], m[1][r], m[2][r], m[3][r]] };
+    let r0 = row(0);
+    let r1 = row(1);
+    let r2 = row(2);
+    let r3 = row(3);
+
+    let mut planes = [[0.0f32; 4]; 6];
+    // Left
+    planes[0] = [r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]];
+    // Right
+    planes[1] = [r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]];
+    // Bottom
+    planes[2] = [r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]];
+    // Top
+    planes[3] = [r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]];
+    // Near
+    planes[4] = [r3[0] + r2[0], r3[1] + r2[1], r3[2] + r2[2], r3[3] + r2[3]];
+    // Far
+    planes[5] = [r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]];
+
+    // Normalize each plane
+    for p in &mut planes {
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if len > 1e-8 {
+            p[0] /= len;
+            p[1] /= len;
+            p[2] /= len;
+            p[3] /= len;
+        }
+    }
+    planes
+}
+
+/// Hi-Z depth pyramid for occlusion culling.
+pub struct HiZPyramid {
+    pub texture: wgpu::Texture,
+    pub views: Vec<wgpu::TextureView>,
+    pub mip_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub downscale_pipeline: wgpu::ComputePipeline,
+    pub downscale_bind_group_layout: wgpu::BindGroupLayout,
+    pub downscale_uniform_buffer: wgpu::Buffer,
+}
+
+/// Uniform for the Hi-Z downscale shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct HizDownscaleUniforms {
+    pub src_width: f32,
+    pub src_height: f32,
+    pub dst_width: f32,
+    pub dst_height: f32,
+}
+
+impl HiZPyramid {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let mip_count = ((width.max(height) as f32).log2().floor() as u32 + 1).min(11);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Hi-Z Depth Pyramid"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let views: Vec<wgpu::TextureView> = (0..mip_count)
+            .map(|mip| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some(&format!("Hi-Z Mip {mip}")),
+                    base_mip_level: mip,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        let downscale_shader_source =
+            std::fs::read_to_string(core_workspace_root().join("shaders/wgsl/hiz_downscale.wgsl"))
+                .unwrap_or_else(|_| {
+                    include_str!("../../../shaders/wgsl/hiz_downscale.wgsl").to_string()
+                });
+        let downscale_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hi-Z Downscale Shader"),
+            source: wgpu::ShaderSource::Wgsl(downscale_shader_source.into()),
+        });
+
+        let downscale_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Hi-Z Downscale Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let downscale_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Hi-Z Downscale Uniforms"),
+                contents: bytemuck::bytes_of(&HizDownscaleUniforms {
+                    src_width: width as f32,
+                    src_height: height as f32,
+                    dst_width: (width / 2) as f32,
+                    dst_height: (height / 2) as f32,
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let downscale_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Hi-Z Downscale Pipeline Layout"),
+                bind_group_layouts: &[&downscale_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let downscale_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Hi-Z Downscale Pipeline"),
+            layout: Some(&downscale_pipeline_layout),
+            module: &downscale_module,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        Self {
+            texture,
+            views,
+            mip_count,
+            width,
+            height,
+            downscale_pipeline,
+            downscale_bind_group_layout,
+            downscale_uniform_buffer,
+        }
+    }
+
+    /// Generate the depth pyramid by dispatching a chain of downscale compute
+    /// passes. The source depth must have already been copied into mip 0.
+    pub fn generate(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let mut w = self.width;
+        let mut h = self.height;
+
+        for mip in 1..self.mip_count {
+            let dst_w = (w / 2).max(1);
+            let dst_h = (h / 2).max(1);
+
+            queue.write_buffer(
+                &self.downscale_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&HizDownscaleUniforms {
+                    src_width: w as f32,
+                    src_height: h as f32,
+                    dst_width: dst_w as f32,
+                    dst_height: dst_h as f32,
+                }),
+            );
+
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Hi-Z Downscale BG mip {mip}")),
+                layout: &self.downscale_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.views[(mip - 1) as usize],
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.views[mip as usize]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.downscale_uniform_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(&format!("Hi-Z Downscale Mip {mip}")),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.downscale_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(dst_w.div_ceil(8), dst_h.div_ceil(8), 1);
+
+            w = dst_w;
+            h = dst_h;
+        }
+    }
+}
+
+/// GPU-driven indirect draw pipeline that replaces per-chunk CPU draw calls
+/// with compute-driven culling and a single `multi_draw_indexed_indirect`.
+pub struct IndirectDrawPipeline {
+    /// Storage buffer holding all `ChunkDrawSlot` entries uploaded from CPU.
+    pub chunk_slot_buffer: wgpu::Buffer,
+    /// Storage buffer for the emitted `IndirectDrawCommand` entries (output of cull).
+    pub indirect_draw_buffer: wgpu::Buffer,
+    /// Storage buffer for the atomic draw count.
+    pub draw_count_buffer: wgpu::Buffer,
+    /// Maximum number of chunks the buffers can hold.
+    pub max_chunks: u32,
+    /// Current number of chunk slots uploaded from CPU.
+    pub chunk_count: u32,
+    /// Compute pipeline for visibility culling.
+    pub cull_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for the culling compute shader.
+    pub cull_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind group for culling (re-created when chunk data changes).
+    pub cull_bind_group: wgpu::BindGroup,
+    /// Uniform buffer for CullUniforms.
+    pub cull_uniform_buffer: wgpu::Buffer,
+    /// Hi-Z bind group layout for occlusion culling.
+    pub hiz_bind_group_layout: wgpu::BindGroupLayout,
+    /// Hi-Z bind group (re-created when pyramid changes).
+    pub hiz_bind_group: wgpu::BindGroup,
+    /// Compute pipeline for chunk LOD selection.
+    pub lod_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for the LOD compute shader.
+    pub lod_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind group for LOD selection.
+    pub lod_bind_group: wgpu::BindGroup,
+    /// Uniform buffer for LodUniforms.
+    pub lod_uniform_buffer: wgpu::Buffer,
+    /// LOD configuration.
+    pub lod_config: ChunkLodConfig,
+    /// Visibility culling configuration.
+    pub cull_config: VisibilityCullConfig,
+    /// Hi-Z depth pyramid for occlusion culling.
+    pub hiz_pyramid: HiZPyramid,
+}
+
+impl IndirectDrawPipeline {
+    pub fn new(device: &wgpu::Device, max_chunks: u32, width: u32, height: u32) -> Self {
+        let cull_config = VisibilityCullConfig::default();
+        let lod_config = ChunkLodConfig::default();
+
+        // --- Buffers ---
+        let chunk_slot_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Chunk Slot Buffer"),
+            size: (max_chunks as u64) * std::mem::size_of::<ChunkDrawSlot>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let indirect_draw_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Indirect Draw Buffer"),
+            size: (max_chunks as u64) * std::mem::size_of::<IndirectDrawCommand>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let draw_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Draw Count Buffer"),
+            size: 4, // single u32 atomic
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // --- Cull compute pipeline ---
+        let cull_shader_source = std::fs::read_to_string(
+            core_workspace_root().join("shaders/wgsl/visibility_cull.wgsl"),
+        )
+        .unwrap_or_else(|_| include_str!("../../../shaders/wgsl/visibility_cull.wgsl").to_string());
+        let cull_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Visibility Cull Shader"),
+            source: wgpu::ShaderSource::Wgsl(cull_shader_source.into()),
+        });
+
+        let cull_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Cull Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let cull_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Cull Uniform Buffer"),
+            contents: bytemuck::bytes_of(&CullUniforms {
+                view_projection: Mat4::IDENTITY.to_cols_array_2d(),
+                frustum_planes: [[0.0; 4]; 6],
+                chunk_count: 0,
+                enable_occlusion: 0,
+                hiz_width: width as f32,
+                hiz_height: height as f32,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let cull_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Cull Bind Group"),
+            layout: &cull_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cull_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: chunk_slot_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: indirect_draw_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: draw_count_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Hi-Z bind group (for occlusion culling)
+        let hiz_pyramid = HiZPyramid::new(device, width.max(1), height.max(1));
+
+        let hiz_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Hi-Z Cull Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let hiz_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Hi-Z Sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let hiz_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Hi-Z Cull Bind Group"),
+            layout: &hiz_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        hiz_pyramid
+                            .views
+                            .first()
+                            .expect("Hi-Z must have at least one mip"),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&hiz_sampler),
+                },
+            ],
+        });
+
+        let cull_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Cull Pipeline Layout"),
+            bind_group_layouts: &[&cull_bind_group_layout, &hiz_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let cull_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Visibility Cull Pipeline"),
+            layout: Some(&cull_pipeline_layout),
+            module: &cull_module,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        // --- LOD compute pipeline ---
+        let lod_shader_source =
+            std::fs::read_to_string(core_workspace_root().join("shaders/wgsl/chunk_lod.wgsl"))
+                .unwrap_or_else(|_| {
+                    include_str!("../../../shaders/wgsl/chunk_lod.wgsl").to_string()
+                });
+        let lod_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Chunk LOD Shader"),
+            source: wgpu::ShaderSource::Wgsl(lod_shader_source.into()),
+        });
+
+        let lod_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("LOD Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let lod_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("LOD Uniform Buffer"),
+            contents: bytemuck::bytes_of(&LodUniforms {
+                camera_position: [0.0; 4],
+                lod_distances: lod_config.distances,
+                chunk_count: 0,
+                max_lod: lod_config.max_lod,
+                _pad: [0; 2],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let lod_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("LOD Bind Group"),
+            layout: &lod_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: lod_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: chunk_slot_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let lod_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("LOD Pipeline Layout"),
+            bind_group_layouts: &[&lod_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Chunk LOD Pipeline"),
+            layout: Some(&lod_pipeline_layout),
+            module: &lod_module,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        Self {
+            chunk_slot_buffer,
+            indirect_draw_buffer,
+            draw_count_buffer,
+            max_chunks,
+            chunk_count: 0,
+            cull_pipeline,
+            cull_bind_group_layout,
+            cull_bind_group,
+            cull_uniform_buffer,
+            hiz_bind_group_layout,
+            hiz_bind_group,
+            lod_pipeline,
+            lod_bind_group_layout,
+            lod_bind_group,
+            lod_uniform_buffer,
+            lod_config,
+            cull_config,
+            hiz_pyramid,
+        }
+    }
+
+    /// Upload chunk draw slots from the CPU. This is the single per-frame
+    /// CPU→GPU transfer — everything else happens on the GPU.
+    pub fn upload_chunk_slots(&mut self, queue: &wgpu::Queue, slots: &[ChunkDrawSlot]) {
+        let count = (slots.len() as u32).min(self.max_chunks);
+        self.chunk_count = count;
+        if count > 0 {
+            queue.write_buffer(
+                &self.chunk_slot_buffer,
+                0,
+                bytemuck::cast_slice(&slots[..count as usize]),
+            );
+        }
+    }
+
+    /// Run the full GPU-driven culling pipeline:
+    /// 1. LOD selection compute pass
+    /// 2. Clear the draw count to zero
+    /// 3. Visibility + occlusion culling compute pass
+    ///
+    /// After this, `indirect_draw_buffer` contains the compacted draw commands
+    /// and `draw_count_buffer` holds how many were emitted.
+    pub fn dispatch_culling(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view_projection: Mat4,
+        camera_position: Vec3,
+    ) {
+        if self.chunk_count == 0 {
+            return;
+        }
+
+        let frustum_planes = extract_frustum_planes(&view_projection);
+        let workgroup_size = self.cull_config.workgroup_size;
+
+        // Update LOD uniforms
+        queue.write_buffer(
+            &self.lod_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&LodUniforms {
+                camera_position: [camera_position.x, camera_position.y, camera_position.z, 0.0],
+                lod_distances: self.lod_config.distances,
+                chunk_count: self.chunk_count,
+                max_lod: self.lod_config.max_lod,
+                _pad: [0; 2],
+            }),
+        );
+
+        // Update cull uniforms
+        queue.write_buffer(
+            &self.cull_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&CullUniforms {
+                view_projection: view_projection.to_cols_array_2d(),
+                frustum_planes,
+                chunk_count: self.chunk_count,
+                enable_occlusion: u32::from(self.cull_config.occlusion_cull),
+                hiz_width: self.hiz_pyramid.width as f32,
+                hiz_height: self.hiz_pyramid.height as f32,
+            }),
+        );
+
+        // Clear draw count to zero
+        queue.write_buffer(&self.draw_count_buffer, 0, &0u32.to_ne_bytes());
+
+        let dispatch_count = self.chunk_count.div_ceil(workgroup_size);
+
+        // 1. LOD selection pass
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Chunk LOD Selection"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.lod_pipeline);
+            pass.set_bind_group(0, &self.lod_bind_group, &[]);
+            pass.dispatch_workgroups(dispatch_count, 1, 1);
+        }
+
+        // 2. Visibility culling pass (includes frustum + optional Hi-Z occlusion)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Visibility Culling"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.cull_pipeline);
+            pass.set_bind_group(0, &self.cull_bind_group, &[]);
+            pass.set_bind_group(1, &self.hiz_bind_group, &[]);
+            pass.dispatch_workgroups(dispatch_count, 1, 1);
+        }
+    }
+
+    /// Bind the indirect draw buffer and issue a multi-draw-indexed-indirect.
+    pub fn draw_indirect<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        if self.chunk_count == 0 {
+            return;
+        }
+        render_pass.multi_draw_indexed_indirect(&self.indirect_draw_buffer, 0, self.chunk_count);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Screen-space effect configurations — individual effect parameters that the
 // post-processing stack references.
 // ---------------------------------------------------------------------------
@@ -1479,6 +2923,8 @@ pub struct SurfaceRenderer {
     gbuffer_layout: GBufferLayout,
     #[allow(dead_code)]
     _capabilities: BackendCapabilities,
+    deferred: Option<DeferredPipeline>,
+    indirect: Option<IndirectDrawPipeline>,
 }
 
 impl SurfaceRenderer {
@@ -1611,6 +3057,8 @@ impl SurfaceRenderer {
             pass_scheduler,
             gbuffer_layout,
             _capabilities: backend_capabilities,
+            deferred: None,
+            indirect: None,
         })
     }
 
@@ -1624,6 +3072,52 @@ impl SurfaceRenderer {
         self.frame_uniform.aspect_ratio = aspect_ratio(width, height);
         self.surface.configure(&self.device, &self.config);
         self.depth_target = DepthTarget::new(&self.device, &self.config);
+        if let Some(deferred) = &mut self.deferred {
+            deferred.resize(&self.device, width, height);
+        }
+    }
+
+    /// Enable the deferred rendering pipeline with G-buffer, lighting, shadow, and
+    /// translucent passes.  The pass scheduler is automatically switched to
+    /// `deferred_with_shadows`.
+    pub fn enable_deferred(&mut self) -> Result<()> {
+        self.enable_deferred_with_backend(ShaderBackend::Wgsl)
+    }
+
+    /// Enable the deferred rendering pipeline with a specific shader backend.
+    pub fn enable_deferred_with_backend(&mut self, backend: ShaderBackend) -> Result<()> {
+        let deferred = DeferredPipeline::with_shader_backend(
+            &self.device,
+            self.config.format,
+            &self.uniform_bind_group_layout,
+            self.config.width,
+            self.config.height,
+            backend,
+        )?;
+        let effective = deferred.shader_backend;
+        self.deferred = Some(deferred);
+        self.pass_scheduler = PassScheduler::deferred_with_shadows(4);
+        log::info!("Deferred pipeline enabled with shadow mapping (shader backend: {effective:?})");
+        Ok(())
+    }
+
+    /// Enable GPU-driven indirect rendering on top of the deferred pipeline.
+    /// Must be called after `enable_deferred`.
+    pub fn enable_indirect(&mut self) -> Result<()> {
+        if self.deferred.is_none() {
+            anyhow::bail!("enable_deferred must be called before enable_indirect");
+        }
+        let gpu_config = GpuChunkBufferConfig::default();
+        let indirect = IndirectDrawPipeline::new(
+            &self.device,
+            gpu_config.max_chunks,
+            self.config.width,
+            self.config.height,
+        );
+        self.indirect = Some(indirect);
+        self.pass_scheduler = PassScheduler::gpu_indirect(4);
+        log::info!("GPU-driven indirect rendering pipeline enabled");
+        Ok(())
     }
 
     #[profiling::function]
@@ -1696,13 +3190,197 @@ impl SurfaceRenderer {
                     pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..self.index_count, 0, 0..1);
                 }
-                RenderPassKind::GBufferFill
-                | RenderPassKind::DeferredLighting
-                | RenderPassKind::Translucent
-                | RenderPassKind::ShadowMap => {
-                    // Deferred passes are registered in the scheduler but
-                    // execute as no-ops until the deferred pipeline shaders
-                    // and render targets are wired.
+                RenderPassKind::GBufferFill => {
+                    if let Some(deferred) = &self.deferred {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some(scheduled_pass.label),
+                            color_attachments: &[
+                                Some(wgpu::RenderPassColorAttachment {
+                                    view: &deferred.gbuffer_targets.albedo_view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                }),
+                                Some(wgpu::RenderPassColorAttachment {
+                                    view: &deferred.gbuffer_targets.normal_view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                }),
+                                Some(wgpu::RenderPassColorAttachment {
+                                    view: &deferred.gbuffer_targets.material_view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                }),
+                            ],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &deferred.gbuffer_targets.depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(1.0),
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            occlusion_query_set: None,
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&deferred.gbuffer_pipeline);
+                        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                        pass.set_index_buffer(
+                            self.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..self.index_count, 0, 0..1);
+                    }
+                }
+                RenderPassKind::ShadowMap => {
+                    if let Some(deferred) = &self.deferred {
+                        let sun_dir = Vec3::new(0.35, 0.8, 0.28).normalize();
+                        let light_vp =
+                            DeferredPipeline::compute_light_vp(sun_dir, Vec3::ZERO, 64.0);
+                        let shadow_uniform = ShadowPassUniform {
+                            light_view_projection: light_vp.to_cols_array_2d(),
+                            model: Mat4::IDENTITY.to_cols_array_2d(),
+                        };
+                        self.queue.write_buffer(
+                            &deferred.shadow_uniform_buffer,
+                            0,
+                            bytemuck::bytes_of(&shadow_uniform),
+                        );
+
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some(scheduled_pass.label),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &deferred.shadow_depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(1.0),
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            occlusion_query_set: None,
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&deferred.shadow_pipeline);
+                        pass.set_bind_group(0, &deferred.shadow_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                        pass.set_index_buffer(
+                            self.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..self.index_count, 0, 0..1);
+                    }
+                }
+                RenderPassKind::DeferredLighting => {
+                    if let Some(deferred) = &self.deferred {
+                        let camera = Camera::orbiting(time_seconds);
+                        let aspect = aspect_ratio(self.config.width, self.config.height);
+                        let vp = camera.view_projection_matrix(aspect);
+                        let sun_dir = Vec3::new(0.35, 0.8, 0.28).normalize();
+                        let light_vp =
+                            DeferredPipeline::compute_light_vp(sun_dir, Vec3::ZERO, 64.0);
+                        let cam_eye = camera.eye();
+                        let lighting_uniform = LightingUniform {
+                            light_direction: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
+                            light_color: [1.0, 0.95, 0.9, 1.0],
+                            camera_position: [cam_eye.x, cam_eye.y, cam_eye.z, 0.0],
+                            inv_view_projection: vp.inverse().to_cols_array_2d(),
+                            shadow_view_projection: light_vp.to_cols_array_2d(),
+                            ambient_color: [0.15, 0.17, 0.2, 1.0],
+                        };
+                        self.queue.write_buffer(
+                            &deferred.lighting_uniform_buffer,
+                            0,
+                            bytemuck::bytes_of(&lighting_uniform),
+                        );
+
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some(scheduled_pass.label),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(self.clear_color),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            occlusion_query_set: None,
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&deferred.lighting_pipeline);
+                        pass.set_bind_group(0, &deferred.lighting_bind_group, &[]);
+                        pass.set_bind_group(1, &deferred.lighting_data_bind_group, &[]);
+                        pass.draw(0..3, 0..1); // fullscreen triangle
+                    }
+                }
+                RenderPassKind::Translucent => {
+                    if let Some(deferred) = &self.deferred {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some(scheduled_pass.label),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &deferred.gbuffer_targets.depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            occlusion_query_set: None,
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&deferred.translucent_pipeline);
+                        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                        pass.set_index_buffer(
+                            self.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..self.index_count, 0, 0..1);
+                    }
+                }
+                RenderPassKind::ComputeCull => {
+                    if let Some(indirect) = &self.indirect {
+                        let camera = Camera::orbiting(time_seconds);
+                        let aspect = aspect_ratio(self.config.width, self.config.height);
+                        let vp = camera.view_projection_matrix(aspect);
+                        let cam_eye = camera.eye();
+                        indirect.dispatch_culling(
+                            &self.device,
+                            &self.queue,
+                            &mut encoder,
+                            vp,
+                            cam_eye,
+                        );
+                    }
                 }
             }
         }
@@ -1730,6 +3408,14 @@ impl SurfaceRenderer {
 
 fn aspect_ratio(width: u32, height: u32) -> f32 {
     width.max(1) as f32 / height.max(1) as f32
+}
+
+fn core_workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf()
 }
 
 fn create_render_pipeline(
@@ -1833,13 +3519,16 @@ fn pack_color(color: [f32; 3]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendConfig, BlockKind, BloomConfig, Camera, ChunkSection, ColorGradingConfig,
-        FrameTimings, GBufferLayout, GiMode, GpuChunkBufferConfig, LabPbrExtension,
-        MaterialDefinition, Mesh, PackedBlockMeta, PassScheduler, PbrProperties, PostProcessStack,
-        RenderPassKind, ShadowCascadeConfig, ShadowFilterMode, SharedRendererConfig, SsaoConfig,
-        SsrConfig, TaaConfig, TextureArrayConfig, TonemapOperator, VisibilityCullConfig,
-        VolumetricConfig, VoxelGiConfig, WaterShadingConfig,
+        BackendConfig, BlockKind, BloomConfig, Camera, ChunkDrawSlot, ChunkLodConfig, ChunkSection,
+        ColorGradingConfig, CullUniforms, FrameTimings, GBufferLayout, GiMode,
+        GpuChunkBufferConfig, HizDownscaleUniforms, IndirectDrawCommand, LabPbrExtension,
+        LodUniforms, MaterialDefinition, Mesh, PackedBlockMeta, PassScheduler, PbrProperties,
+        PostProcessStack, RenderPassKind, ShaderBackend, ShadowCascadeConfig, ShadowFilterMode,
+        SharedRendererConfig, SsaoConfig, SsrConfig, TaaConfig, TextureArrayConfig,
+        TonemapOperator, VisibilityCullConfig, VolumetricConfig, VoxelGiConfig, WaterShadingConfig,
+        extract_frustum_planes,
     };
+    use glam::{Mat4, Vec3};
     use std::mem::size_of;
 
     #[test]
@@ -2597,5 +4286,162 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ShaderBackend tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shader_backend_default_is_wgsl() {
+        assert_eq!(ShaderBackend::default(), ShaderBackend::Wgsl);
+    }
+
+    #[test]
+    fn shader_backend_detect_returns_wgsl_without_spv_file() {
+        // In test environments there is no pre-compiled .spv file.
+        let backend = ShaderBackend::detect();
+        assert_eq!(backend, ShaderBackend::Wgsl);
+    }
+
+    // --- Phase 13: GPU-driven indirect rendering tests ---
+
+    #[test]
+    fn indirect_draw_command_matches_wgpu_layout() {
+        assert_eq!(std::mem::size_of::<IndirectDrawCommand>(), 20);
+        let cmd = IndirectDrawCommand {
+            index_count: 36,
+            instance_count: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        };
+        let bytes = bytemuck::bytes_of(&cmd);
+        assert_eq!(bytes.len(), 20);
+    }
+
+    #[test]
+    fn chunk_draw_slot_has_correct_size() {
+        // 3 × i32 + 3 × u32/i32 + 2 × u32 padding = 32 bytes
+        assert_eq!(std::mem::size_of::<ChunkDrawSlot>(), 32);
+    }
+
+    #[test]
+    fn cull_uniforms_layout() {
+        assert_eq!(std::mem::size_of::<CullUniforms>(), 4 * (16 + 24 + 4));
+    }
+
+    #[test]
+    fn lod_uniforms_layout() {
+        assert_eq!(std::mem::size_of::<LodUniforms>(), 48);
+    }
+
+    #[test]
+    fn extract_frustum_planes_identity_produces_unit_planes() {
+        let vp = Mat4::IDENTITY;
+        let planes = extract_frustum_planes(&vp);
+        // Each plane should have unit-length normal
+        for plane in &planes {
+            let len = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+            assert!((len - 1.0).abs() < 0.01, "plane normal not unit: {len}");
+        }
+    }
+
+    #[test]
+    fn extract_frustum_planes_count_is_six() {
+        let vp = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+        let planes = extract_frustum_planes(&vp);
+        assert_eq!(planes.len(), 6);
+    }
+
+    #[test]
+    fn extract_frustum_planes_origin_inside() {
+        // The origin should be inside a standard perspective frustum centred at origin
+        let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+        let vp = proj * view;
+        let planes = extract_frustum_planes(&vp);
+        // Test point at the origin — should be in front of most planes
+        // (centre of the view should be inside the frustum)
+        let point = Vec3::ZERO;
+        let mut inside_count = 0;
+        for plane in &planes {
+            let d = plane[0] * point.x + plane[1] * point.y + plane[2] * point.z + plane[3];
+            if d >= -0.1 {
+                inside_count += 1;
+            }
+        }
+        assert!(
+            inside_count >= 5,
+            "origin should be inside frustum, but only passed {inside_count}/6 planes"
+        );
+    }
+
+    #[test]
+    fn gpu_chunk_buffer_config_indirect_default() {
+        let config = GpuChunkBufferConfig::default();
+        assert_eq!(config.max_chunks, 1024);
+        assert!(config.use_indirect_draw);
+    }
+
+    #[test]
+    fn visibility_cull_config_workgroup_64() {
+        let config = VisibilityCullConfig::default();
+        assert_eq!(config.workgroup_size, 64);
+        assert!(config.frustum_cull);
+        assert!(!config.occlusion_cull);
+    }
+
+    #[test]
+    fn chunk_lod_config_defaults() {
+        let config = ChunkLodConfig::default();
+        assert_eq!(config.distances, [64.0, 128.0, 256.0, 512.0]);
+        assert_eq!(config.max_lod, 3);
+    }
+
+    #[test]
+    fn hiz_downscale_uniforms_size() {
+        assert_eq!(std::mem::size_of::<HizDownscaleUniforms>(), 16);
+    }
+
+    #[test]
+    fn render_pass_kind_includes_compute_cull() {
+        let kind = RenderPassKind::ComputeCull;
+        assert_eq!(kind, RenderPassKind::ComputeCull);
+    }
+
+    #[test]
+    fn pass_scheduler_gpu_indirect_has_compute_cull() {
+        let scheduler = PassScheduler::gpu_indirect(2);
+        let passes = scheduler.passes();
+        // Should be: ComputeCull, Shadow×2, GBufferFill, DeferredLighting, Translucent
+        assert_eq!(passes.len(), 6);
+        assert_eq!(passes[0].kind, RenderPassKind::ComputeCull);
+        assert_eq!(passes[1].kind, RenderPassKind::ShadowMap);
+        assert_eq!(passes[2].kind, RenderPassKind::ShadowMap);
+        assert_eq!(passes[3].kind, RenderPassKind::GBufferFill);
+        assert_eq!(passes[4].kind, RenderPassKind::DeferredLighting);
+        assert_eq!(passes[5].kind, RenderPassKind::Translucent);
+    }
+
+    #[test]
+    fn frustum_planes_far_point_outside() {
+        let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 50.0);
+        let vp = proj * view;
+        let planes = extract_frustum_planes(&vp);
+        // A point far behind the camera should fail the near plane
+        let behind = Vec3::new(0.0, 0.0, 10.0); // behind camera looking at -Z
+        let mut behind_plane_count = 0;
+        for plane in &planes {
+            let d = plane[0] * behind.x + plane[1] * behind.y + plane[2] * behind.z + plane[3];
+            if d < 0.0 {
+                behind_plane_count += 1;
+            }
+        }
+        assert!(
+            behind_plane_count >= 1,
+            "point behind camera should fail at least one plane"
+        );
     }
 }

@@ -11,6 +11,7 @@ bytemuck.workspace = true
 ferridian-shader = { path = "../shader" }
 ferridian-utils = { path = "../utils" }
 glam.workspace = true
+log.workspace = true
 profiling.workspace = true
 rayon.workspace = true
 wgpu.workspace = true

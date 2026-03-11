@@ -1,14 +1,9 @@
 [package]
-name = "ferridian-shader"
+name = "ferridian-shared-types"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 bytemuck.workspace = true
-naga.workspace = true
-serde.workspace = true
-wgpu.workspace = true
-zip.workspace = true

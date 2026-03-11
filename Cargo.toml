@@ -4,10 +4,12 @@ members = [
     "crates/jni-bridge",
     "crates/minecraft",
     "crates/shader",
+    "crates/shared-types",
     "crates/utils",
     "crates/xtask",
     "examples/standalone",
 ]
+exclude = ["crates/shader-gpu"]
 resolver = "2"
 
 [workspace.package]
@@ -20,20 +22,24 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.97"
 bytemuck = { version = "1.25.0", features = ["derive"] }
+ferridian-shared-types = { path = "crates/shared-types" }
 camino = "1.1.9"
 clap = { version = "4.5.32", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 glam = "0.30.0"
 jni = "0.22.0"
+log = "0.4"
 naga = { version = "27", features = ["glsl-in", "wgsl-in"] }
 pollster = "0.4.0"
+raw-window-handle = "0.6"
 profiling = "1.0"
 rayon = "1.11"
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
-wgpu = { version = "27.0.1", features = ["glsl", "wgsl"] }
+wgpu = { version = "27.0.1", features = ["glsl", "wgsl", "spirv"] }
 winit = "0.30.12"
+zip = "8.2"
 
 [profile.dev]
 debug = 1

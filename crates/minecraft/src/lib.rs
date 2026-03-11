@@ -1,5 +1,6 @@
 use ferridian_core::RenderBackendPlan;
 use ferridian_shader::ShaderPipelineConfig;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkCoord {
@@ -165,6 +166,65 @@ impl ShaderPackAdapter {
             active_stages: Vec::new(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shader pack loading bridge — connects ferridian-shader's ShaderPackLoader
+// to the Iris-facing ShaderPackAdapter so loaded packs configure the pipeline.
+// ---------------------------------------------------------------------------
+
+/// Result of loading an Iris shader pack: an adapter with the active stages,
+/// plus the raw shader programs from the pack.
+#[derive(Debug, Clone)]
+pub struct LoadedShaderPack {
+    pub adapter: ShaderPackAdapter,
+    pub pack: ferridian_shader::ShaderPack,
+}
+
+/// Load an Iris shader pack (directory or .zip) and produce the adapter and
+/// program list needed to configure the deferred pipeline.
+///
+/// This is the main bridge between the shader crate's loading code and the
+/// Minecraft Iris integration layer.
+pub fn load_iris_shader_pack(path: &Path) -> anyhow::Result<LoadedShaderPack> {
+    let pack = ferridian_shader::ShaderPackLoader::load(path)?;
+
+    // Determine which Iris stages are present based on loaded programs.
+    let mut stages: Vec<IrisPassStage> = Vec::new();
+    for program in &pack.programs {
+        let stage = match program.stage {
+            ferridian_shader::IrisShaderStage::Shadow => IrisPassStage::Shadow,
+            ferridian_shader::IrisShaderStage::GBuffersTerrain => IrisPassStage::GBuffersTerrain,
+            ferridian_shader::IrisShaderStage::GBuffersEntities => IrisPassStage::GBuffersEntities,
+            ferridian_shader::IrisShaderStage::GBuffersBlock => IrisPassStage::GBuffersBlock,
+            ferridian_shader::IrisShaderStage::GBuffersWater => IrisPassStage::GBuffersWater,
+            ferridian_shader::IrisShaderStage::GBuffersSkyBasic => IrisPassStage::GBuffersSkyBasic,
+            ferridian_shader::IrisShaderStage::GBuffersSkyTextured => {
+                IrisPassStage::GBuffersSkyTextured
+            }
+            ferridian_shader::IrisShaderStage::GBuffersWeather => IrisPassStage::GBuffersWeather,
+            ferridian_shader::IrisShaderStage::GBuffersHand => IrisPassStage::GBuffersHand,
+            ferridian_shader::IrisShaderStage::Deferred => IrisPassStage::Deferred,
+            ferridian_shader::IrisShaderStage::Composite => IrisPassStage::Composite,
+            ferridian_shader::IrisShaderStage::Final => IrisPassStage::Final,
+        };
+        if !stages.contains(&stage) {
+            stages.push(stage);
+        }
+    }
+
+    // If no stages were explicitly matched, fall back to the default Iris order.
+    if stages.is_empty() {
+        stages = IrisPassStage::all_stages().to_vec();
+    }
+
+    Ok(LoadedShaderPack {
+        adapter: ShaderPackAdapter {
+            model: ShaderPackModel::IrisLegacy,
+            active_stages: stages,
+        },
+        pack,
+    })
 }
 
 // ---------------------------------------------------------------------------

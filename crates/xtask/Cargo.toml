@@ -9,3 +9,8 @@ version.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
+spirvbuilder = { package = "spirv-builder", version = "0.9", default-features = false, features = ["use-installed-tools"], optional = true }
+
+[features]
+default = []
+shaders = ["spirvbuilder"]

@@ -1,0 +1,21 @@
+[package]
+name = "ferridian-shader-gpu"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+# This crate is NOT a workspace member — it is compiled separately to SPIR-V
+# via `cargo xtask build-shaders` using spirv-builder and a nightly toolchain.
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+spirv-std = "0.9"
+ferridian-shared-types = { path = "../shared-types" }
+
+# glam without std for GPU execution
+[dependencies.glam]
+version = "0.30.0"
+default-features = false
+features = ["libm"]

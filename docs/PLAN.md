@@ -171,6 +171,35 @@ As much as possible, all work should be test driven.
 - [x] Package platform-specific JNI libraries for Java consumption
 - [x] Add cross-compilation or cross-platform release automation for native artifacts
 
+## Phase 12: Rust-GPU shader authoring
+
+- [x] Create `ferridian-shared-types` crate with `#[repr(C)]` types shared between CPU and GPU
+- [x] Create `ferridian-shader-gpu` crate with Rust-authored shaders compiled to SPIR-V via `rust-gpu`
+- [x] Implement PBR lighting math (Cook-Torrance BRDF, GGX, Smith, Fresnel, ACES tonemap) in Rust
+- [x] Add SPIR-V entry points: G-buffer fill, shadow depth, deferred lighting, translucent forward
+- [x] Add `cargo xtask build-shaders` command using `spirv-builder` behind a feature gate
+- [x] Add `SpirvModule` loader and `ShaderDialect::SpirV` variant to the shader crate
+- [x] Wire SPIR-V modules into `ferridian-core` pipeline creation as the primary shader path
+- [x] Add CPU-side unit tests for all lighting math functions
+- [x] Achieve feature parity between Rust-GPU SPIR-V shaders and existing WGSL shaders
+- [x] Keep WGSL shaders as a fallback for backends without SPIR-V support
+
+## Phase 13: GPU-driven indirect rendering pipeline
+
+- [x] Replace per-chunk draw calls with multi-draw-indirect dispatched from compute
+- [x] Add compute-driven frustum and occlusion culling that writes the indirect draw buffer
+- [x] Implement Hi-Z occlusion culling using the previous frame's depth pyramid
+- [x] Move chunk LOD selection and draw compaction to GPU compute
+- [x] Reduce per-frame CPU-GPU synchronization to a single indirect buffer upload
+
+## Phase 14: Advanced lighting and effects in Rust-GPU
+
+- [x] Port screen-space effects (GTAO, SSR, volumetric fog) from WGSL to Rust-GPU
+- [x] Add cascaded shadow maps with smooth cascade blending in Rust
+- [x] Implement stochastic SSR with Hi-Z traversal in Rust-GPU
+- [x] Add ReSTIR-style direct lighting as an optional high-quality mode
+- [ ] Profile and optimize SPIR-V output vs hand-written WGSL for critical passes
+
 ## Learning and research backlog
 
 - [x] Study `wgpu-mc` for JNI and Minecraft renderer ownership patterns

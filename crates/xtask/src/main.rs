@@ -43,6 +43,8 @@ enum Commands {
         #[arg(long, default_value = "release")]
         profile: String,
     },
+    /// Compile Rust-GPU shaders to SPIR-V.
+    BuildShaders,
 }
 
 fn main() -> Result<()> {
@@ -60,6 +62,7 @@ fn main() -> Result<()> {
         Commands::Pgo { binary } => run_pgo(&binary),
         Commands::PackageJni { profile } => run_package_jni(&profile),
         Commands::CrossBuild { target, profile } => run_cross_build(&target, &profile),
+        Commands::BuildShaders => run_build_shaders(),
     }
 }
 
@@ -161,6 +164,54 @@ fn run_package_jni(profile: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_build_shaders() -> Result<()> {
+    let root = workspace_root();
+    let shader_crate = root.join("crates").join("shader-gpu");
+    let spirv_out = root.join("shaders").join("spirv");
+
+    if !shader_crate.join("Cargo.toml").exists() {
+        bail!("shader-gpu crate not found at {shader_crate}");
+    }
+
+    // Ensure output directory exists
+    std::fs::create_dir_all(&spirv_out).with_context(|| format!("failed to create {spirv_out}"))?;
+
+    // Build with spirv-builder if compiled with the `shaders` feature.
+    // Otherwise fall back to invoking cargo with the spirv target directly.
+    #[cfg(feature = "shaders")]
+    {
+        use spirvbuilder::{MetadataPrintout, SpirvBuilder};
+
+        eprintln!("Building shaders with spirv-builder...");
+        let result = SpirvBuilder::new(&*shader_crate, "spirv-unknown-vulkan1.2")
+            .print_metadata(MetadataPrintout::Full)
+            .build()
+            .context("spirv-builder failed")?;
+
+        let src = result.module.unwrap_single();
+        let dest = spirv_out.join("ferridian_shader_gpu.spv");
+
+        std::fs::copy(&src, &dest).with_context(|| format!("failed to copy SPIR-V to {dest}"))?;
+
+        eprintln!("SPIR-V module written to {dest}");
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "shaders"))]
+    {
+        // Fallback: tell the user how to build with the shaders feature
+        eprintln!("To compile shaders, you need:");
+        eprintln!("  1. A nightly Rust toolchain with rust-src component");
+        eprintln!("     rustup toolchain install nightly --component rust-src");
+        eprintln!("  2. Build xtask with the shaders feature:");
+        eprintln!("     cargo run -p xtask --features shaders -- build-shaders");
+        eprintln!();
+        eprintln!("Alternatively, pre-compiled SPIR-V modules in shaders/spirv/");
+        eprintln!("are loaded at build time if available.");
+        Ok(())
+    }
+}
+
 fn run_cross_build(target: &str, profile: &str) -> Result<()> {
     let root = workspace_root();
 
@@ -201,7 +252,6 @@ fn run_ci(fast: bool, skip_java: bool) -> Result<()> {
             "clippy",
             "--workspace",
             "--all-targets",
-            "--all-features",
             "--",
             "-D",
             "warnings",
@@ -210,7 +260,7 @@ fn run_ci(fast: bool, skip_java: bool) -> Result<()> {
     )?;
 
     if !fast {
-        run_command("cargo", &["test", "--workspace", "--all-features"], &root)?;
+        run_command("cargo", &["test", "--workspace"], &root)?;
     }
 
     if !skip_java {

@@ -10,6 +10,7 @@ use std::time::SystemTime;
 pub enum ShaderDialect {
     Glsl,
     Wgsl,
+    SpirV,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -117,6 +118,9 @@ impl ShaderAsset {
                         defines: Default::default(),
                     },
                 })
+            }
+            ShaderDialect::SpirV => {
+                panic!("SpirV dialect requires create_module_spirv with raw bytes");
             }
         }
     }
@@ -472,12 +476,451 @@ impl ShaderPermutationCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SPIR-V module loading — loads pre-compiled Rust-GPU SPIR-V modules
+// ---------------------------------------------------------------------------
+
+/// A pre-compiled SPIR-V shader module produced by `cargo xtask build-shaders`.
+#[derive(Debug, Clone)]
+pub struct SpirvModule {
+    pub label: String,
+    pub spirv_bytes: Vec<u8>,
+}
+
+impl SpirvModule {
+    /// Load a SPIR-V module from raw bytes (e.g. from `include_bytes!`).
+    pub fn from_bytes(label: impl Into<String>, bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            bytes.len() >= 4 && bytes.len() % 4 == 0,
+            "SPIR-V data must be 4-byte aligned and non-empty"
+        );
+        // Validate SPIR-V magic number (0x07230203)
+        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        anyhow::ensure!(
+            magic == 0x07230203,
+            "invalid SPIR-V magic number: {magic:#010x}"
+        );
+        Ok(Self {
+            label: label.into(),
+            spirv_bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Load a SPIR-V module from a file on disk.
+    pub fn load_file(label: impl Into<String>, path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read SPIR-V file: {}", path.display()))?;
+        Self::from_bytes(label, &bytes)
+    }
+
+    /// Load the default Ferridian SPIR-V module from `shaders/spirv/`.
+    pub fn load_default() -> Result<Self> {
+        let path = workspace_root()
+            .join("shaders")
+            .join("spirv")
+            .join("ferridian_shader_gpu.spv");
+        Self::load_file("ferridian-shader-gpu", &path)
+    }
+
+    /// Create a wgpu shader module from this SPIR-V data.
+    ///
+    /// # Safety
+    /// The caller must ensure the SPIR-V bytecode is valid and trusted.
+    /// wgpu will validate the SPIR-V through naga, but malformed modules
+    /// could still cause driver issues on some backends.
+    pub unsafe fn create_module(&self, device: &wgpu::Device) -> wgpu::ShaderModule {
+        let spirv: &[u32] = bytemuck::cast_slice(&self.spirv_bytes);
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&self.label),
+            source: wgpu::ShaderSource::SpirV(std::borrow::Cow::Borrowed(spirv)),
+        })
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.spirv_bytes.len() / 4
+    }
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("workspace root")
         .to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// Shader pack loading — reads Iris/OptiFine .zip or folder-based shader packs,
+// parses shaders.properties, and loads GLSL programs per pipeline stage.
+// ---------------------------------------------------------------------------
+
+/// Iris/OptiFine shader stage file names mapped to their pipeline function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IrisShaderStage {
+    Shadow,
+    GBuffersTerrain,
+    GBuffersEntities,
+    GBuffersBlock,
+    GBuffersWater,
+    GBuffersSkyBasic,
+    GBuffersSkyTextured,
+    GBuffersWeather,
+    GBuffersHand,
+    Deferred,
+    Composite,
+    Final,
+}
+
+impl IrisShaderStage {
+    pub fn file_prefix(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::GBuffersTerrain => "gbuffers_terrain",
+            Self::GBuffersEntities => "gbuffers_entities",
+            Self::GBuffersBlock => "gbuffers_block",
+            Self::GBuffersWater => "gbuffers_water",
+            Self::GBuffersSkyBasic => "gbuffers_skybasic",
+            Self::GBuffersSkyTextured => "gbuffers_skytextured",
+            Self::GBuffersWeather => "gbuffers_weather",
+            Self::GBuffersHand => "gbuffers_hand",
+            Self::Deferred => "deferred",
+            Self::Composite => "composite",
+            Self::Final => "final",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Shadow,
+            Self::GBuffersTerrain,
+            Self::GBuffersEntities,
+            Self::GBuffersBlock,
+            Self::GBuffersWater,
+            Self::GBuffersSkyBasic,
+            Self::GBuffersSkyTextured,
+            Self::GBuffersWeather,
+            Self::GBuffersHand,
+            Self::Deferred,
+            Self::Composite,
+            Self::Final,
+        ]
+    }
+}
+
+/// A loaded GLSL shader program for a single Iris pipeline stage.
+#[derive(Debug, Clone)]
+pub struct IrisShaderProgram {
+    pub stage: IrisShaderStage,
+    pub vertex_source: Option<String>,
+    pub fragment_source: Option<String>,
+    pub compute_source: Option<String>,
+}
+
+impl IrisShaderProgram {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(ref src) = self.vertex_source {
+            validate_glsl(src, GlslStage::Vertex)
+                .with_context(|| format!("{} vertex", self.stage.file_prefix()))?;
+        }
+        if let Some(ref src) = self.fragment_source {
+            validate_glsl(src, GlslStage::Fragment)
+                .with_context(|| format!("{} fragment", self.stage.file_prefix()))?;
+        }
+        if let Some(ref src) = self.compute_source {
+            validate_glsl(src, GlslStage::Compute)
+                .with_context(|| format!("{} compute", self.stage.file_prefix()))?;
+        }
+        Ok(())
+    }
+
+    pub fn has_any_source(&self) -> bool {
+        self.vertex_source.is_some()
+            || self.fragment_source.is_some()
+            || self.compute_source.is_some()
+    }
+}
+
+/// Parsed `shaders.properties` from an Iris shader pack.
+#[derive(Debug, Clone, Default)]
+pub struct ShaderPackProperties {
+    pub entries: HashMap<String, String>,
+}
+
+impl ShaderPackProperties {
+    pub fn parse(content: &str) -> Self {
+        let mut entries = HashMap::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once('=') {
+                entries.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+        Self { entries }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(|s| s.as_str())
+    }
+
+    pub fn shadow_map_resolution(&self) -> u32 {
+        self.get("shadow.resolution")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048)
+    }
+
+    pub fn shadow_distance(&self) -> f32 {
+        self.get("shadowDistance")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128.0)
+    }
+
+    pub fn old_lighting(&self) -> bool {
+        self.get("oldLighting")
+            .map(|s| s == "true")
+            .unwrap_or(false)
+    }
+
+    pub fn normals_enabled(&self) -> bool {
+        self.get("texture.normal")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn specular_enabled(&self) -> bool {
+        self.get("texture.specular")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// A loaded Iris shader pack with all programs and properties.
+#[derive(Debug, Clone)]
+pub struct ShaderPack {
+    pub name: String,
+    pub properties: ShaderPackProperties,
+    pub programs: Vec<IrisShaderProgram>,
+}
+
+impl ShaderPack {
+    pub fn program(&self, stage: IrisShaderStage) -> Option<&IrisShaderProgram> {
+        self.programs.iter().find(|p| p.stage == stage)
+    }
+
+    pub fn active_stages(&self) -> Vec<IrisShaderStage> {
+        self.programs
+            .iter()
+            .filter(|p| p.has_any_source())
+            .map(|p| p.stage)
+            .collect()
+    }
+
+    pub fn validate_all(&self) -> Result<()> {
+        for program in &self.programs {
+            if program.has_any_source() {
+                program.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Loads shader packs from zip files or directories.
+pub struct ShaderPackLoader;
+
+impl ShaderPackLoader {
+    /// Load a shader pack from a directory on disk.
+    pub fn load_directory(path: &Path) -> Result<ShaderPack> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let shaders_dir = if path.join("shaders").exists() {
+            path.join("shaders")
+        } else {
+            path.to_path_buf()
+        };
+
+        let properties = Self::load_properties_from_dir(&shaders_dir)?;
+        let programs = Self::load_programs_from_dir(&shaders_dir)?;
+
+        Ok(ShaderPack {
+            name,
+            properties,
+            programs,
+        })
+    }
+
+    /// Load a shader pack from a .zip file.
+    pub fn load_zip(path: &Path) -> Result<ShaderPack> {
+        let name = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open shader pack: {}", path.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("invalid zip file: {}", path.display()))?;
+
+        // Detect the shaders/ prefix inside the zip
+        let prefix = Self::detect_zip_prefix(&mut archive);
+
+        let properties = Self::load_properties_from_zip(&mut archive, &prefix)?;
+        let programs = Self::load_programs_from_zip(&mut archive, &prefix)?;
+
+        Ok(ShaderPack {
+            name,
+            properties,
+            programs,
+        })
+    }
+
+    /// Auto-detect whether the path is a directory or zip and load accordingly.
+    pub fn load(path: &Path) -> Result<ShaderPack> {
+        if path.is_dir() {
+            Self::load_directory(path)
+        } else {
+            Self::load_zip(path)
+        }
+    }
+
+    fn load_properties_from_dir(shaders_dir: &Path) -> Result<ShaderPackProperties> {
+        let props_path = shaders_dir.join("shaders.properties");
+        if props_path.exists() {
+            let content = fs::read_to_string(&props_path)
+                .with_context(|| format!("failed to read {}", props_path.display()))?;
+            Ok(ShaderPackProperties::parse(&content))
+        } else {
+            Ok(ShaderPackProperties::default())
+        }
+    }
+
+    fn load_programs_from_dir(shaders_dir: &Path) -> Result<Vec<IrisShaderProgram>> {
+        let mut programs = Vec::new();
+        for &stage in IrisShaderStage::all() {
+            let prefix = stage.file_prefix();
+            let vsh = shaders_dir.join(format!("{prefix}.vsh"));
+            let fsh = shaders_dir.join(format!("{prefix}.fsh"));
+            let csh = shaders_dir.join(format!("{prefix}.csh"));
+
+            let vertex_source = if vsh.exists() {
+                Some(fs::read_to_string(&vsh).with_context(|| vsh.display().to_string())?)
+            } else {
+                None
+            };
+            let fragment_source = if fsh.exists() {
+                Some(fs::read_to_string(&fsh).with_context(|| fsh.display().to_string())?)
+            } else {
+                None
+            };
+            let compute_source = if csh.exists() {
+                Some(fs::read_to_string(&csh).with_context(|| csh.display().to_string())?)
+            } else {
+                None
+            };
+
+            let program = IrisShaderProgram {
+                stage,
+                vertex_source,
+                fragment_source,
+                compute_source,
+            };
+            if program.has_any_source() {
+                programs.push(program);
+            }
+        }
+        Ok(programs)
+    }
+
+    fn detect_zip_prefix(archive: &mut zip::ZipArchive<fs::File>) -> String {
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index_raw(i) {
+                let name = entry.name();
+                if name.ends_with("shaders.properties") {
+                    if let Some(prefix) = name.strip_suffix("shaders.properties") {
+                        return prefix.to_string();
+                    }
+                }
+            }
+        }
+        // Try common prefixes
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index_raw(i) {
+                let name = entry.name();
+                if name.contains("/shaders/") {
+                    if let Some(idx) = name.find("/shaders/") {
+                        return format!("{}/shaders/", &name[..idx]);
+                    }
+                }
+                if name.starts_with("shaders/") {
+                    return "shaders/".to_string();
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn load_properties_from_zip(
+        archive: &mut zip::ZipArchive<fs::File>,
+        prefix: &str,
+    ) -> Result<ShaderPackProperties> {
+        let props_name = format!("{prefix}shaders.properties");
+        match archive.by_name(&props_name) {
+            Ok(mut entry) => {
+                let mut content = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut content)?;
+                Ok(ShaderPackProperties::parse(&content))
+            }
+            Err(_) => Ok(ShaderPackProperties::default()),
+        }
+    }
+
+    fn load_programs_from_zip(
+        archive: &mut zip::ZipArchive<fs::File>,
+        prefix: &str,
+    ) -> Result<Vec<IrisShaderProgram>> {
+        let mut programs = Vec::new();
+        for &stage in IrisShaderStage::all() {
+            let file_prefix = stage.file_prefix();
+            let vsh_name = format!("{prefix}{file_prefix}.vsh");
+            let fsh_name = format!("{prefix}{file_prefix}.fsh");
+            let csh_name = format!("{prefix}{file_prefix}.csh");
+
+            let vertex_source = Self::read_zip_entry(archive, &vsh_name)?;
+            let fragment_source = Self::read_zip_entry(archive, &fsh_name)?;
+            let compute_source = Self::read_zip_entry(archive, &csh_name)?;
+
+            let program = IrisShaderProgram {
+                stage,
+                vertex_source,
+                fragment_source,
+                compute_source,
+            };
+            if program.has_any_source() {
+                programs.push(program);
+            }
+        }
+        Ok(programs)
+    }
+
+    fn read_zip_entry(
+        archive: &mut zip::ZipArchive<fs::File>,
+        name: &str,
+    ) -> Result<Option<String>> {
+        match archive.by_name(name) {
+            Ok(mut entry) => {
+                let mut content = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut content)?;
+                Ok(Some(content))
+            }
+            Err(zip::result::ZipError::FileNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -957,5 +1400,182 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
         assert!(result.is_err());
         let errs = result.unwrap_err();
         assert!(errs.iter().any(|e| e.contains("unexpected binding")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Shader pack loading tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shader_pack_properties_parses_key_value() {
+        let content = "shadow.resolution=4096\nshadowDistance=256.0\n# comment\noldLighting=true\n";
+        let props = super::ShaderPackProperties::parse(content);
+        assert_eq!(props.shadow_map_resolution(), 4096);
+        assert_eq!(props.shadow_distance(), 256.0);
+        assert!(props.old_lighting());
+    }
+
+    #[test]
+    fn shader_pack_properties_defaults() {
+        let props = super::ShaderPackProperties::default();
+        assert_eq!(props.shadow_map_resolution(), 2048);
+        assert_eq!(props.shadow_distance(), 128.0);
+        assert!(!props.old_lighting());
+    }
+
+    #[test]
+    fn iris_shader_stage_file_prefixes() {
+        assert_eq!(super::IrisShaderStage::Shadow.file_prefix(), "shadow");
+        assert_eq!(
+            super::IrisShaderStage::GBuffersTerrain.file_prefix(),
+            "gbuffers_terrain"
+        );
+        assert_eq!(super::IrisShaderStage::Final.file_prefix(), "final");
+    }
+
+    #[test]
+    fn iris_shader_stage_all_has_12_entries() {
+        assert_eq!(super::IrisShaderStage::all().len(), 12);
+    }
+
+    #[test]
+    fn shader_pack_loads_from_directory() {
+        let dir = std::env::temp_dir().join("ferridian-test-shaderpack");
+        let shaders_dir = dir.join("shaders");
+        let _ = fs::create_dir_all(&shaders_dir);
+
+        // Write a minimal shader pack
+        fs::write(
+            shaders_dir.join("shaders.properties"),
+            "shadow.resolution=1024\n",
+        )
+        .unwrap();
+        fs::write(
+            shaders_dir.join("gbuffers_terrain.vsh"),
+            "#version 150\nvoid main() { gl_Position = vec4(0.0); }\n",
+        )
+        .unwrap();
+        fs::write(
+            shaders_dir.join("gbuffers_terrain.fsh"),
+            "#version 150\nout vec4 fragColor;\nvoid main() { fragColor = vec4(1.0); }\n",
+        )
+        .unwrap();
+
+        let pack = super::ShaderPackLoader::load_directory(&dir).unwrap();
+        assert_eq!(pack.properties.shadow_map_resolution(), 1024);
+        assert_eq!(pack.active_stages().len(), 1);
+        assert_eq!(
+            pack.active_stages()[0],
+            super::IrisShaderStage::GBuffersTerrain
+        );
+        assert!(
+            pack.program(super::IrisShaderStage::GBuffersTerrain)
+                .unwrap()
+                .vertex_source
+                .is_some()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shader_pack_auto_detect_shaders_subdir() {
+        let dir = std::env::temp_dir().join("ferridian-test-shaderpack-autodetect");
+        let shaders_dir = dir.join("shaders");
+        let _ = fs::create_dir_all(&shaders_dir);
+
+        fs::write(
+            shaders_dir.join("shadow.vsh"),
+            "#version 150\nvoid main() { gl_Position = vec4(0.0); }\n",
+        )
+        .unwrap();
+
+        let pack = super::ShaderPackLoader::load(&dir).unwrap();
+        assert_eq!(pack.active_stages().len(), 1);
+        assert_eq!(pack.active_stages()[0], super::IrisShaderStage::Shadow);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iris_program_validate_checks_glsl() {
+        let program = super::IrisShaderProgram {
+            stage: super::IrisShaderStage::GBuffersTerrain,
+            vertex_source: Some(
+                "#version 450\nvoid main() { gl_Position = vec4(0.0); }\n".to_string(),
+            ),
+            fragment_source: None,
+            compute_source: None,
+        };
+        assert!(program.validate().is_ok());
+    }
+
+    #[test]
+    fn iris_program_has_any_source() {
+        let empty = super::IrisShaderProgram {
+            stage: super::IrisShaderStage::Shadow,
+            vertex_source: None,
+            fragment_source: None,
+            compute_source: None,
+        };
+        assert!(!empty.has_any_source());
+
+        let with_vert = super::IrisShaderProgram {
+            vertex_source: Some("test".into()),
+            ..empty
+        };
+        assert!(with_vert.has_any_source());
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate new WGSL deferred shaders
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validates_gbuffer_fill_shader() {
+        let root = super::workspace_root();
+        let source = fs::read_to_string(root.join("shaders/wgsl/gbuffer_fill.wgsl"))
+            .expect("should read gbuffer_fill.wgsl");
+        let result = validate_wgsl(&source);
+        assert!(
+            result.is_ok(),
+            "gbuffer_fill.wgsl should validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validates_deferred_lighting_shader() {
+        let root = super::workspace_root();
+        let source = fs::read_to_string(root.join("shaders/wgsl/deferred_lighting.wgsl"))
+            .expect("should read deferred_lighting.wgsl");
+        let result = validate_wgsl(&source);
+        assert!(
+            result.is_ok(),
+            "deferred_lighting.wgsl should validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validates_shadow_depth_shader() {
+        let root = super::workspace_root();
+        let source = fs::read_to_string(root.join("shaders/wgsl/shadow_depth.wgsl"))
+            .expect("should read shadow_depth.wgsl");
+        let result = validate_wgsl(&source);
+        assert!(
+            result.is_ok(),
+            "shadow_depth.wgsl should validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validates_translucent_shader() {
+        let root = super::workspace_root();
+        let source = fs::read_to_string(root.join("shaders/wgsl/translucent.wgsl"))
+            .expect("should read translucent.wgsl");
+        let result = validate_wgsl(&source);
+        assert!(
+            result.is_ok(),
+            "translucent.wgsl should validate: {result:?}"
+        );
     }
 }
