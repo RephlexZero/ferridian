@@ -62,6 +62,19 @@ As much as possible, all work should be test driven.
 - [ ] Feed Minecraft scene state into Rust without direct renderer ownership on the Java side
 - [ ] Prototype chunk upload and per-frame camera updates over JNI
 
+## Fabric, Iris, and Aperture integration track
+
+- [ ] Build the first Minecraft runtime path on Fabric rather than a custom launcher path
+- [ ] Define a renderer integration seam that can sit behind Iris today without making Iris-specific assumptions pervasive across the codebase
+- [ ] Identify the exact Fabric lifecycle, resource reload, and world render hooks needed for first renderer bootstrap
+- [ ] Add an Iris compatibility layer for shader-pack-era resource, camera, and frame timing inputs
+- [ ] Keep shader-pack parsing, renderer ownership, and GPU scheduling on the Rust side even when Fabric or Iris provides the entry point
+- [ ] Treat Iris integration as a transitional adapter and keep the Java bridge boundary narrow enough to swap to Aperture when its public pipeline stabilizes
+- [ ] Introduce an internal `RenderPipelineProvider` or similarly named abstraction so `standalone`, `fabric-iris`, and future `aperture` entry paths can drive the same renderer core
+- [ ] Capture differences between Fabric plus Iris expectations and anticipated Aperture expectations in a compatibility matrix under `docs/`
+- [ ] Prototype one end-to-end path where Fabric boots the mod, Iris-facing hooks collect frame inputs, and Rust executes the renderer through the existing bridge API
+- [ ] Revisit and simplify the adapter layer once Aperture publishes stable integration points
+
 ## Renderer milestones
 
 ### Phase 1: Immediate next renderer steps
@@ -136,6 +149,7 @@ As much as possible, all work should be test driven.
 - [x] The standalone slice renders chunk-like geometry rather than only a demo primitive
 - [x] Java can successfully call into Rust over JNI
 - [ ] A single renderer path can be driven either from standalone or from the Java shell
+- [ ] A Fabric-based bootstrap path can reach the shared renderer core without forking renderer ownership into Java
 
 ## Definition of “feature complete enough to chase Minecraft integration”
 
@@ -144,6 +158,7 @@ As much as possible, all work should be test driven.
 - [x] The JNI boundary is real, not stubbed
 - [x] The Java shell can load and call the native library
 - [x] The standalone path can render a simple voxel scene with depth and basic lighting
+- [ ] A Fabric plus Iris adapter path exists and is isolated enough to be replaced by Aperture later
 
 ## Definition of “feature complete enough to chase shader-pack parity”
 
