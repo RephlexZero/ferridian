@@ -11,4 +11,13 @@ bytemuck.workspace = true
 ferridian-shader = { path = "../shader" }
 ferridian-utils = { path = "../utils" }
 glam.workspace = true
+profiling.workspace = true
+rayon.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "mesher"
+harness = false

@@ -8,8 +8,9 @@ Core repository docs live under `docs/`:
 
 - `docs/ARCHITECTURE.md`
 - `docs/CONTRIBUTING.md`
-- `docs/plan.md`
-- `docs/comment.md`
+- `docs/PLAN.md`
+- `docs/RESEARCH.md`
+- `docs/WGPU_COMPATIBILITY.md`
 
 ## Current shape
 

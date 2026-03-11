@@ -10,4 +10,5 @@ name = "ferridian_jni"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+ferridian-utils = { path = "../utils" }
 jni.workspace = true
