@@ -48,8 +48,19 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH="/usr/local/cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path \
+    # registry/ doesn't exist yet at this point; create it now so its
+    # permissive mode is what gets copied into the named volume that mounts
+    # over it later (an empty bind target created by Docker at run time would
+    # otherwise land root-owned and unwritable by the ubuntu user).
+    && mkdir -p "$CARGO_HOME/registry" \
     && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
 # Runtime dir some display plumbing expects when running windowed.
 RUN mkdir -p /tmp/runtime-dir && chmod 1777 /tmp/runtime-dir
 ENV XDG_RUNTIME_DIR=/tmp/runtime-dir
+
+# ubuntu (uid 1000, present in this base image) owns its home dir's mise data
+# subtree up front, mirroring the cargo/rustup trick above — otherwise the
+# named volume the devcontainer mounts over it lands root-owned and the
+# ubuntu user can't write to it without a one-off sudo chown.
+RUN mkdir -p /home/ubuntu/.local/share/mise && chown -R ubuntu:ubuntu /home/ubuntu/.local

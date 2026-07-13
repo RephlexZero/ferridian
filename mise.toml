@@ -11,9 +11,13 @@ taplo = "0.9"
 typos = "1"
 "cargo:cargo-nextest" = "0.9"
 "cargo:cargo-deny" = "0.18"
-# Slang release binaries (slangc). If this backend fails on your platform, install
-# from https://github.com/shader-slang/slang/releases and set FERRIDIAN_SLANGC.
-"ubi:shader-slang/slang" = "2026.13"
+# slangc is intentionally NOT mise-managed: its release tarball is bin/slangc
+# dynamically linked against sibling lib/*.so files, but the ubi backend only
+# extracts a single executable and drops those libs, so the result can't run
+# regardless of exe/matching_regex tuning. Install the full tarball yourself
+# from https://github.com/shader-slang/slang/releases (version must match
+# SLANG_VERSION in ci/mesa.Dockerfile) and set FERRIDIAN_SLANGC to its
+# bin/slangc — the devcontainer/CI image already does this for you.
 
 [tasks.setup]
 description = "One-time repo setup: git hooks + LFS"
