@@ -1,0 +1,4 @@
+goldens/**/*.png filter=lfs diff=lfs merge=lfs -text
+goldens/**/*.exr filter=lfs diff=lfs merge=lfs -text
+*.spv binary
+shim/src/main/generated/** linguist-generated=true

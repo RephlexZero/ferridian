@@ -1,0 +1,13 @@
+---
+source: crates/pack-compiler/tests/reflection.rs
+expression: reflection
+---
+[[entry_points]]
+name = 'fs_main'
+stage = 'Fragment'
+
+[[bindings]]
+set = 0
+binding = 1
+storage_class = 'Uniform'
+name = 'scene_uniforms'

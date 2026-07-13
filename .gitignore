@@ -1,10 +1,9 @@
 /target
 **/target
 /.gradle
-/java/.gradle
-/java/build
-/.devcontainer/.cache
+/shim/.gradle
+/shim/build
+/docs/book
 /.DS_Store
 *.iml
-*.spv
-docs/last_chat.md
+/packs/**/build

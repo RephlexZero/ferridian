@@ -1,0 +1,16 @@
+[package]
+name = "packc"
+description = "Shader-author CLI: build / validate / serve packs"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+ferridian-pack-compiler = { workspace = true }

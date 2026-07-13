@@ -1,0 +1,19 @@
+[package]
+name = "shim-codegen"
+description = "Generates the Java side of the shim from the contract crate"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+ferridian-contract = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

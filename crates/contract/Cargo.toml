@@ -1,0 +1,16 @@
+[package]
+name = "ferridian-contract"
+description = "Single source of truth for the Java<->Rust ABI and pass metadata"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }

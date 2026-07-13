@@ -1,0 +1,17 @@
+[package]
+name = "ferridian-vk-rt"
+description = "Vulkan device/queue/sync/alloc runtime (ash)"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ash = { workspace = true }
+gpu-allocator = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

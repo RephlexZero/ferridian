@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_FERRIDIAN_overlay",
+        "type": "GLOBAL",
+        "library_path": "./libferridian_vk_layer.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Ferridian shader engine interception layer (skeleton, pass-through)",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        },
+        "disable_environment": {
+            "FERRIDIAN_DISABLE": "1"
+        }
+    }
+}

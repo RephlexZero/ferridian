@@ -1,0 +1,23 @@
+[package]
+name = "ferridian-pack-compiler"
+description = "Slang -> SPIR-V pack compilation and reflection"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+camino = { workspace = true }
+ferridian-pack-format = { workspace = true }
+rspirv = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

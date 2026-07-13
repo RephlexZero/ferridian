@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/contract",
+    "crates/engine",
+    "crates/pack-compiler",
+    "crates/pack-format",
+    "crates/testkit",
+    "crates/vk-layer",
+    "crates/vk-rt",
+    "tools/packc",
+    "tools/shim-codegen",
+    "tools/upstream-watch",
+]
+exclude = ["crates/pack-format/fuzz"]
+resolver = "2"
+
+[workspace.package]
+authors = ["Ferridian contributors"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.96"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[workspace.dependencies]
+anyhow = "1.0"
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+camino = "1.1"
+clap = { version = "4.5", features = ["derive"] }
+ferridian-contract = { path = "crates/contract" }
+ferridian-engine = { path = "crates/engine" }
+ferridian-pack-compiler = { path = "crates/pack-compiler" }
+ferridian-pack-format = { path = "crates/pack-format" }
+ferridian-vk-rt = { path = "crates/vk-rt" }
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+insta = { version = "1.42", features = ["toml"] }
+rspirv = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+toml = "0.8"
+tracing = "0.1"
+ureq = { version = "2.12", features = ["json"] }
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

@@ -1,0 +1,58 @@
+# The one true entrypoint: `mise install` provisions tools, `mise run <task>` runs workflows.
+# Rust itself is pinned by rust-toolchain.toml (rustup), not here.
+# Loose version pins below get tightened as part of the container-image bump procedure
+# (see ci/mesa.Dockerfile) so dev and CI move in lockstep.
+
+[tools]
+java = "temurin-21"
+gradle = "8"
+lefthook = "1"
+taplo = "0.9"
+typos = "1"
+"cargo:cargo-nextest" = "0.9"
+"cargo:cargo-deny" = "0.18"
+# Slang release binaries (slangc). If this backend fails on your platform, install
+# from https://github.com/shader-slang/slang/releases and set FERRIDIAN_SLANGC.
+"ubi:shader-slang/slang" = "latest"
+
+[tasks.setup]
+description = "One-time repo setup: git hooks + LFS"
+run = ["lefthook install", "git lfs install"]
+
+[tasks.fmt]
+description = "Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Static checks: fmt, clippy -D warnings, TOML style, typos"
+run = [
+    "cargo fmt --all -- --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "taplo fmt --check",
+    "typos",
+]
+
+[tasks.test]
+description = "Run the test suite with nextest"
+run = "cargo nextest run --workspace"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace"
+
+[tasks.ci]
+description = "Everything CI runs, in fast-fail order"
+depends = ["lint", "test"]
+
+[tasks.gpu-test]
+description = "Run GPU-gated testkit tests (needs a Vulkan ICD; lavapipe in the container)"
+run = "cargo nextest run -p ferridian-testkit"
+env = { FERRIDIAN_GPU_TESTS = "1" }
+
+[tasks.shim-build]
+description = "Build the Fabric shim (needs network for Loom/Minecraft resolution; not part of ci yet)"
+run = "gradle -p shim build"
+
+[tasks.deny]
+description = "Supply-chain gate"
+run = "cargo deny check"

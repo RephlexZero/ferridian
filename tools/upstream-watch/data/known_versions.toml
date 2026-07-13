@@ -1,0 +1,4 @@
+# Versions upstream-watch has already processed. The first CI run of
+# `upstream-watch poll --write` populates this with the full manifest history;
+# after that, any new entry means Mojang shipped something we haven't looked at.
+versions = []

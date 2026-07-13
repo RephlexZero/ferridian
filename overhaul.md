@@ -1,0 +1,201 @@
+# Project Plan — Rust Vulkan Shader Engine for Minecraft: Java Edition
+
+**Working codename:** TBD (candidates: *Caustic*, *Umbra*, *Lumen* is taken by UE — pick before repo creation)
+**Author:** Jake · **Date:** 2026-07-13 · **Status:** Draft v1
+
+---
+
+## 1. Thesis
+
+Mojang is replacing Java Edition's OpenGL renderer with Vulkan (experimental in 26.2, OpenGL removal expected ~2027). This forcibly obsoletes the entire OptiFine-lineage shader ecosystem. The incumbent successor, **Aperture** (Iris team), dropped backwards compatibility — meaning every shader pack author on earth is rewriting from scratch right now, and the switching cost to an alternative platform is at an all-time low.
+
+We do **not** compete for the "default shader loader" position (Aperture wins that on distribution). We build the **flagship/high-end engine**: a Rust-native, Vulkan-native shader platform whose differentiators are:
+
+1. **Modern GPU techniques as engine primitives** — ReSTIR GI, radiance cascades, ray-query paths on capable hardware, temporal upscaling as infrastructure (Ferridian thesis, redeployed).
+2. **A materially better pack-developer experience** — Slang-based packs compiled AOT to SPIR-V with full reflection, an LSP, hot reload, and build-time validation (vs. Aperture's TypeScript-config-over-GLSL, validated at load time).
+3. **Robustness as an architecture property** — Vulkan layer interception (stable Khronos ABI), a single generated Java↔Rust contract, and automated upstream breakage detection against Mojang's now-unobfuscated jars.
+
+### Why now (the window)
+
+- Minecraft is unobfuscated as of 26.1 (Dec 2025) → automated version-diff tooling is finally viable.
+- Native Vulkan shipped experimental in 26.2 (June 2026); renderer internals still churning → everyone's engine is young.
+- Aperture's Vulkan rewrite only began ~Jan 2026; private beta reached shader devs in May 2026. Their core is ~6 months old.
+- Iris will be discontinued once Vulkan is default. Pack authors are mid-rewrite **now**. Window closes when major packs ship Aperture versions (estimate: 6–12 months).
+
+---
+
+## 2. Competitive landscape (as of July 2026)
+
+| Player | Position | Notes |
+|---|---|---|
+| **Mojang Vulkan renderer** | Baseline | Experimental in 26.2; Vibrant Visuals will raise vanilla visual floor. Internals unstable until OpenGL removal (~2027). |
+| **Sodium** | Perf incumbent | 0.9.x shipped with early Vulkan support (June 2026). Moat = ecosystem compat, not renderer. Don't compete. |
+| **Aperture** | Loader incumbent-successor | TypeScript pipeline config (`pack.ts`), no legacy pack support, compute/SSBO/CSM support, GLSL underneath. Private beta with pack authors. Wins "default." |
+| **VulkanMod** | Dead end | Being dropped by modpacks in favour of native Vulkan. |
+| **Us** | Flagship tier | Next-gen GI + best-in-class pack toolchain + verifiable safety story. |
+
+**Aperture's exposed flanks:** voluntary moat reset (no legacy packs), young Vulkan core, small core team, TS-runtime-in-loop complexity, loader-not-frontier positioning, macOS/MoltenVK portability risk.
+
+**Our hard requirements to matter:** a stunning reference pack (ours) + at least one recognisable ported pack + credible docs, before Aperture's 1.0 + big-pack releases.
+
+---
+
+## 3. Architecture
+
+### 3.1 Interception strategy
+
+- **Primary seam:** Vulkan layer (implicit/explicit) in Rust (`ash`). Stable, Khronos-versioned ABI; survives game updates by construction. ReShade-style.
+- **Semantic seam:** thin Fabric shim publishing pass metadata (which pipeline = terrain/entities/etc.) over a versioned contract. Regenerated per MC version — mechanically, from unobfuscated sources.
+- **Discipline:** the layer cdylib stays *boring*. All logic lives in `engine`/`vk-rt` behind a clean seam so Miri and unit tests reach maximal code.
+
+### 3.2 Pack format
+
+- **Language:** Slang (primary), GLSL 4.6 (secondary), both → SPIR-V AOT via `pack-compiler`.
+- **Pipeline definition:** declarative pass graph (TOML/RON manifest), compiled + validated at pack build time by `packc`. Reflection-driven binding; no stringly-typed uniforms.
+- **Runtime:** engine consumes a compiled, signed pack artifact. Load-time work ≈ zero; errors surface at author time.
+- **Compat posture:** no OptiFine/Iris legacy support (same call Aperture made). Optional future: Aperture-pack import tool if their format stabilises and licensing allows.
+
+### 3.3 Portability floor
+
+- Target Vulkan 1.3 core + `VK_KHR_portability_subset` compliance for the macOS/MoltenVK path (Mojang's stated reason for the migration is keeping macOS alive → portability subset is the de facto conformance target).
+- Capability tiers: `baseline` (portability-clean), `enhanced` (mesh shading, ray query where present). Engine validates pack requirements against a committed device profile set (incl. MoltenVK profile) at pack build time.
+
+---
+
+## 4. Repository
+
+### 4.1 Layout
+
+```
+.
+├── mise.toml                    # tools + tasks: the one true entrypoint
+├── rust-toolchain.toml
+├── Cargo.toml                   # workspace.lints, workspace.dependencies, profiles
+├── crates/
+│   ├── engine/                  # render graph, frame orchestration (no vulkan init)
+│   ├── vk-rt/                   # device/queue/sync/alloc runtime (ash, gpu-allocator)
+│   ├── vk-layer/                # cdylib interception shell — thin as physics allows
+│   ├── pack-format/             # schema types only, serde, zero I/O (Miri-able)
+│   ├── pack-compiler/           # slang→SPIR-V, reflection (rspirv), validation
+│   ├── contract/                # single source of truth: Java↔Rust ABI + pass metadata
+│   └── testkit/                 # lavapipe bootstrap, VVL-errors-are-panics, goldens
+├── tools/
+│   ├── packc/                   # shader-author CLI: build / validate / serve (hot reload)
+│   ├── shim-codegen/            # contract → generated Java
+│   └── upstream-watch/          # MC manifest poll → decompile → signature diff
+├── shim/                        # Gradle + Loom; ~90% generated
+├── packs/reference/             # the marquee pack; dogfoods packc from day one
+├── goldens/                     # git-lfs image baselines
+├── ci/mesa.Dockerfile           # pinned lavapipe; also the devcontainer base image
+├── .devcontainer/
+├── .github/workflows/           # ci / goldens / upstream / fuzz / release
+└── docs/                        # mdbook — pack-author docs are product surface
+```
+
+### 4.2 Toolchain decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Task runner / tool pinning | **mise** (`mise.toml`) | Pins JDK, lefthook, taplo, slang, etc. cross-OS; task runner included. No crate named `xtask` — logic-bearing tasks are real CLI crates in `tools/`. |
+| Rust pinning | `rust-toolchain.toml` | With mise, covers ~90% of hermeticity without containers on Windows. |
+| Git hooks | **lefthook**, <5 s budget | fmt check, typos, taplo, commit-lint only. Advisory UX; CI is the enforcement layer. Wired by `mise run setup`. |
+| Test runner | **cargo-nextest** | Parallelism, retries for rare lavapipe flakes, JUnit output. |
+| Snapshots | **insta** | SPIR-V reflection dumps + codegen output as reviewable snapshots. |
+| Supply chain | cargo-deny + **cargo-vet** + cargo-auditable + GitHub artifact attestations (SLSA) | We ship a cdylib injected next to people's game — verifiable builds are ethics *and* marketing. |
+| Deps/releases | Renovate + release-plz (conventional commits) | |
+| Deliberately skipped (for now) | Nix, Bazel, cargo-hakari, OSS-Fuzz enrolment | Bloat at this stage; revisit at scale. |
+
+### 4.3 Containers — final position
+
+Exactly **one** image (`ci/mesa.Dockerfile`): pinned Mesa/lavapipe, pushed to GHCR, bumped deliberately with a baseline re-blessing PR. Reason: golden-image tests are only meaningful against a pinned rasteriser.
+
+- **Linux dev (primary):** devcontainer on that same image → dev/CI parity; lavapipe default; mount `/dev/dri` for real-GPU (trivial on Mesa/AMD — no nvidia-toolkit ceremony). Claude Code sessions run sandboxed inside it.
+- **Windows dev:** native, no container. Same `mise run *` commands. Its job: MSVC build + real Windows driver behaviour (untestable in a container anyway). **Never** WSL2-for-Vulkan (Dozen is incomplete and will mislead).
+- **CI:** container for render jobs; plain runners otherwise.
+
+---
+
+## 5. CI / safety wiring
+
+**Per-PR (fast-fail order):**
+1. Lint: `fmt`, `clippy -D warnings` (workspace.lints), typos, taplo.
+2. Build+test matrix: `ubuntu-latest`, `windows-latest`, `macos-14` (Apple silicon) — nextest.
+3. Golden render job (pinned Mesa container): scene fixtures on lavapipe, **VVL enabled, any validation error = test failure**, perceptual diff (dssim-style tolerance) vs LFS baselines.
+4. macOS leg: MoltenVK if runnable on GH macOS VMs; otherwise SwiftShader + static portability-subset capability lint against committed MoltenVK profile. *(Verify MoltenVK-on-runner early — open question.)*
+5. Gates: cargo-semver-checks (public crates), cargo-deny, cargo-vet.
+
+**Nightly:** sync validation + GPU-assisted validation (slow VVL modes); ASan/LSan on `vk-layer` (Linux); Miri on pure crates (`pack-format`, engine internals).
+
+**Weekly:** cargo-fuzz targets — pack manifest parser, SPIR-V reflection input, contract decoder. (Parsers of untrusted packs are the attack surface.)
+
+**Upstream watch (6 h cron):**
+1. Poll Mojang `version_manifest_v2.json`.
+2. New snapshot → download jar (unobfuscated), decompile with Vineflower **in CI only**.
+3. Extract derived **signature inventory** of tracked render classes/methods; diff vs committed inventory.
+4. No diff → green tick on tracking issue. Diff → bot opens issue with signature-level report; Claude Code Action drafts shim-regen PR, gated on goldens passing under the new jar.
+5. **Legal guardrail:** commit only derived inventories (signatures/hashes) — never decompiled Mojang source in a public repo.
+6. Renovate watches Fabric Loader/API; Dependabot watches Vulkan-Headers/VVL releases.
+
+---
+
+## 6. v1 shader pack decision
+
+### Requirements for the v1 port
+Prove the engine on a real-world pack; give users a familiar look at launch; exercise the full pipeline (deferred/CSM/volumetrics/compute) without drowning in settings-surface; be legally distributable.
+
+### Candidates
+
+| Pack | Technical fit | Licence | Verdict |
+|---|---|---|---|
+| **Photon** (sixthsurge) | **Excellent** — modern, clean, well-structured codebase (~98% GLSL); semi-realistic gameplay focus; volumetrics, coloured lighting, SSR, TAA/temporal upscaling; already ships for 26.1.2; moderate settings surface | Source-available **custom licence**: modification OK, but anti-competing-fork clause and no selling derivatives without permission → **port requires written permission** | ✅ **Primary pick — with permission** |
+| Complementary (EminGT) | Most popular; but huge settings surface, BSL-derived legacy structure | Custom, permission needed; author is presumably in Aperture's private-beta orbit | Partnership target for later, not v1 |
+| BSL (Capt Tatsu) | Legacy architecture | Restrictive custom licence | ❌ |
+| Bliss (X0nk, Chocapic13-based) | Popular, decent look | Chocapic13 licence permits modification with credit — most permissive of the majors | ✅ **Fallback** if Photon permission fails |
+| SEUS / Kappa / Nostalgia | — | Proprietary | ❌ |
+
+### Recommendation
+
+**Tier 0 (weeks 1–8):** our own minimal reference pack (`packs/reference/`) — built *with* `packc` from day one; grows into the marquee next-gen-GI showcase. This is non-negotiable regardless of the port.
+
+**Tier 1 (v1 port): Photon.** Best technical fit by a distance: it's the most modern mainstream codebase (clean deferred structure, temporal upscaling already a feature, active on 26.x), scoped tightly enough to port in bounded time, and its author (sixthsurge, UK) has a collaborative track record (credits exchanged with Emin/DrDesten/Jessie). **Action: approach sixthsurge for written permission — or better, collaboration — before writing a line of the port.** A first-mover pack author choosing us over/alongside Aperture is worth more than the port itself.
+
+**Fallback:** Bliss under the Chocapic13 licence (permission-light), accepting an older code lineage; or a clean-room "Photon-class" feature-set pack of our own (no licence risk, more work, still valuable).
+
+**Explicitly rejected:** porting BSL/Complementary without permission — legal exposure + community goodwill damage in the exact community we need to court.
+
+---
+
+## 7. Milestones
+
+| # | Milestone | Target | Exit criteria |
+|---|---|---|---|
+| M0 | Walking skeleton | +2 wk | Repo scaffold; `mise run ci` green on 3 OSes; testkit boots lavapipe and fails a test on a VVL error; mesa image + devcontainer live |
+| M1 | Safety net complete | +6 wk | Golden harness + baselines; upstream-watch opening issues on real snapshots; fuzz targets running |
+| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer |
+| M3 | Pack pipeline v0 | +16 wk | `packc` builds Slang pack → SPIR-V artifact; hot reload; reference pack renders (shadows + deferred + one volumetric) |
+| M4 | Photon port alpha | +24 wk | Permission secured; Photon-on-engine parity screenshots vs Iris/OpenGL reference goldens |
+| M5 | Public alpha | Aligned to Mojang's OpenGL-removal messaging (~late 2026/early 2027) | Reference pack showcase + Photon port + docs + verifiable release artifacts |
+
+Cadence risk: 26.3/26.4 renderer churn will invalidate pass detection repeatedly until OpenGL removal — upstream-watch (M1) exists precisely to make this a 1-day chore, not a surprise.
+
+---
+
+## 8. Risks & mitigations
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| Aperture ships 1.0 + big packs before our alpha | Medium-high | Don't race the loader; win the flagship segment; recruit one marquee pack author early (Photon approach) |
+| Mojang renderer internals churn until 2027 | Certain | Layer-first architecture; upstream-watch; semantic shim regeneratable per version |
+| Vibrant Visuals compresses low-end shader demand | Medium | We target the high end explicitly |
+| Photon permission declined | Medium | Bliss fallback / clean-room pack; permission ask costs one email |
+| MoltenVK not runnable in GH macOS CI | Unknown | Verify in M0; SwiftShader + capability lint fallback |
+| Solo-maintainer bus factor / shipped-state pattern | Known | M0–M1 front-load automation so maintenance is cheap; milestone exit criteria are demos, not research |
+| Legal: decompiled source handling | Low if disciplined | Derived-inventory-only rule in CI; no Mojang code in repo |
+
+## 9. Open questions
+
+1. Confirm Vulkan layer injection works cleanly with the 26.2 experimental renderer on all three OS loaders (Windows registry / Linux manifest / macOS-MoltenVK path).
+2. MoltenVK on GitHub macOS runners — real render or capability-lint only?
+3. Slang maturity for the full pack surface vs GLSL-primary at launch — spike in M3.
+4. Aperture licence & format stability — monitor for a future import tool.
+5. Codename.

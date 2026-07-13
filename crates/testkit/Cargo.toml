@@ -1,0 +1,16 @@
+[package]
+name = "ferridian-testkit"
+description = "GPU test harness: lavapipe bootstrap where validation errors fail tests"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+ash = { workspace = true }
+ferridian-vk-rt = { workspace = true }

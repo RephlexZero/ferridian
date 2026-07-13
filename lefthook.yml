@@ -1,0 +1,22 @@
+# Advisory local hooks (<5 s budget). CI is the enforcement layer.
+# Installed by `mise run setup`.
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    taplo:
+      glob: "*.toml"
+      run: taplo fmt --check
+    typos:
+      run: typos
+
+commit-msg:
+  commands:
+    conventional:
+      run: |
+        head -n1 {1} | grep -qE '^(feat|fix|docs|chore|refactor|perf|test|build|ci|style|revert|demolition)(\([a-z0-9._-]+\))?!?: .+' || {
+          echo "commit message must follow conventional commits (type(scope): subject)"; exit 1;
+        }
