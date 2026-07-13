@@ -1,29 +1,72 @@
+// Dev environment = the CI image (ci/mesa.Dockerfile): same pinned Mesa/lavapipe,
+// VVL, slangc and JDK as the golden-render job, per overhaul.md §4.3. Claude Code
+// runs inside this container.
 {
-    "name": "ferridian",
-    "build": {
-        "dockerfile": "../ci/mesa.Dockerfile",
-        "context": ".."
-    },
-    "runArgs": [
-        "--device=/dev/dri",
-        "--group-add=video"
-    ],
-    "containerEnv": {
-        "DISPLAY": "${localEnv:DISPLAY}",
-        "WAYLAND_DISPLAY": ""
-    },
-    "mounts": [
-        "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"
-    ],
-    "initializeCommand": "xhost +local:docker || true",
-    "postCreateCommand": "mise trust && mise install && mise run setup",
-    "remoteUser": "ubuntu",
-    "customizations": {
-        "vscode": {
-            "extensions": [
-                "rust-lang.rust-analyzer",
-                "tamasfe.even-better-toml"
-            ]
-        }
+  "name": "ferridian",
+  "build": {
+    "dockerfile": "../ci/mesa.Dockerfile",
+    "context": ".."
+  },
+  // Only used to give the ubuntu user passwordless sudo (needed once, in
+  // postCreateCommand, to take ownership of the named volumes below). The CI
+  // image itself stays sudo-free.
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "configureZshAsDefaultShell": false,
+      "username": "ubuntu",
+      "upgradePackages": false
     }
+  },
+  // Real-GPU path (Mesa/AMD, no nvidia-toolkit ceremony). Lavapipe stays the
+  // default ICD; /dev/dri just makes the hardware device available too.
+  "runArgs": [
+    "--device=/dev/dri",
+    "--group-add=video"
+  ],
+  "containerEnv": {
+    // X11 forward; WAYLAND_DISPLAY cleared to force the X11 backend.
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "WAYLAND_DISPLAY": "",
+    // Authenticated GitHub API for mise's ubi/cargo backends — anonymous is
+    // 60 req/h and rate-limits `mise install`. Export a public-scope token on
+    // the host to use this; empty is ignored.
+    "GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}",
+    // Claude Code state lives on the shared ~/.claude mount below.
+    "CLAUDE_CONFIG_DIR": "/home/ubuntu/.claude"
+  },
+  "remoteEnv": {
+    // claude CLI installs to ~/.local/bin (postCreateCommand).
+    "PATH": "/home/ubuntu/.local/bin:${containerEnv:PATH}"
+  },
+  "mounts": [
+    // X11 socket for windowed runs against the host display.
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    // Persist toolchains, crate downloads and mise tool installs across
+    // container rebuilds (delete these volumes to reset to the image pins).
+    "source=ferridian-rustup,target=/usr/local/rustup,type=volume",
+    "source=ferridian-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=ferridian-mise,target=/home/ubuntu/.local/share/mise,type=volume",
+    // Share the host's Claude Code auth/config so no re-login inside the
+    // container. Drop this line + CLAUDE_CONFIG_DIR for an isolated login.
+    "source=${localEnv:HOME}/.claude,target=/home/ubuntu/.claude,type=bind"
+  ],
+  "initializeCommand": "xhost +local:docker || true",
+  // Named volumes are created root-owned; ~/.local must belong to ubuntu before
+  // mise and the claude installer write to it.
+  "postCreateCommand": "sudo chown -R ubuntu:ubuntu /home/ubuntu/.local && mise trust && mise install && mise run setup && curl -fsSL https://claude.ai/install.sh | bash",
+  "waitFor": "postCreateCommand",
+  "remoteUser": "ubuntu",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  }
 }
