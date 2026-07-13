@@ -13,7 +13,7 @@ typos = "1"
 "cargo:cargo-deny" = "0.18"
 # Slang release binaries (slangc). If this backend fails on your platform, install
 # from https://github.com/shader-slang/slang/releases and set FERRIDIAN_SLANGC.
-"ubi:shader-slang/slang" = "latest"
+"ubi:shader-slang/slang" = "2026.13"
 
 [tasks.setup]
 description = "One-time repo setup: git hooks + LFS"

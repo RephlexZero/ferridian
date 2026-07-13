@@ -1,0 +1,17 @@
+# The Ferridian reference pack: dogfoods packc from day one and grows into
+# the marquee next-gen-GI showcase (Tier 0, §6 of the project plan).
+
+[pack]
+name = "reference"
+version = "0.1.0"
+authors = ["Ferridian contributors"]
+
+[requirements]
+tier = "baseline"
+
+[[pass]]
+name = "composite"
+kind = "graphics"
+shader = "shaders/composite.slang"
+inputs = ["game_color"]
+outputs = ["swapchain"]

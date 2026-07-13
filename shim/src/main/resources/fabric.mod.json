@@ -1,0 +1,17 @@
+{
+    "schemaVersion": 1,
+    "id": "ferridian-shim",
+    "version": "0.1.0",
+    "name": "Ferridian Shim",
+    "description": "Publishes render pass metadata to the Ferridian engine over the versioned contract. The engine itself is a Vulkan layer, not a mod.",
+    "authors": ["Ferridian contributors"],
+    "license": "MIT OR Apache-2.0",
+    "environment": "client",
+    "entrypoints": {
+        "client": ["io.ferridian.shim.FerridianShim"]
+    },
+    "depends": {
+        "fabricloader": ">=0.16.0",
+        "minecraft": ">=26.2"
+    }
+}
