@@ -4,6 +4,7 @@ description = "Polls Mojang version manifests and diffs derived signature invent
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

@@ -1,0 +1,36 @@
+# Builds ci/mesa.Dockerfile and pushes immutable tags to GHCR. The pushed
+# image *is* the Mesa pin: bumping it and re-blessing golden baselines happen
+# together in one PR.
+
+name: container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ci/mesa.Dockerfile
+      - .github/workflows/container.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}/mesa
+          TAG=$(date -u +%Y%m%d)-${GITHUB_SHA::8}
+          docker build -f ci/mesa.Dockerfile -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker run --rm "$IMAGE:$TAG" cat /etc/ferridian-pins.txt
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"

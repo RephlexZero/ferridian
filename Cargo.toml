@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "crates/contract",
-    "crates/engine",
-    "crates/pack-compiler",
-    "crates/pack-format",
-    "crates/testkit",
-    "crates/vk-layer",
-    "crates/vk-rt",
-    "tools/packc",
-    "tools/shim-codegen",
-    "tools/upstream-watch",
+  "crates/contract",
+  "crates/engine",
+  "crates/pack-compiler",
+  "crates/pack-format",
+  "crates/testkit",
+  "crates/vk-layer",
+  "crates/vk-rt",
+  "tools/packc",
+  "tools/shim-codegen",
+  "tools/upstream-watch",
 ]
 exclude = ["crates/pack-format/fuzz"]
 resolver = "2"
@@ -18,6 +18,7 @@ resolver = "2"
 authors = ["Ferridian contributors"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+publish = false
 rust-version = "1.96"
 version = "0.1.0"
 

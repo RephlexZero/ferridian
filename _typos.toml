@@ -1,0 +1,3 @@
+[files]
+# Historical plan-of-record prose ("Lumen is taken by UE", pack author names).
+extend-exclude = ["overhaul.md"]

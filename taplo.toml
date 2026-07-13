@@ -1,0 +1,6 @@
+include = ["**/*.toml"]
+exclude = ["packs/**/build/**", "target/**", "**/target/**"]
+
+[formatting]
+align_entries = false
+column_width = 100

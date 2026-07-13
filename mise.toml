@@ -26,10 +26,10 @@ run = "cargo fmt --all"
 [tasks.lint]
 description = "Static checks: fmt, clippy -D warnings, TOML style, typos"
 run = [
-    "cargo fmt --all -- --check",
-    "cargo clippy --workspace --all-targets -- -D warnings",
-    "taplo fmt --check",
-    "typos",
+  "cargo fmt --all -- --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "taplo fmt --check",
+  "typos",
 ]
 
 [tasks.test]

@@ -1,0 +1,9 @@
+[book]
+title = "Ferridian"
+description = "A Vulkan-native shader engine for Minecraft: Java Edition"
+authors = ["Ferridian contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"

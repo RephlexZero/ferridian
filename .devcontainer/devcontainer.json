@@ -1,0 +1,29 @@
+{
+    "name": "ferridian",
+    "build": {
+        "dockerfile": "../ci/mesa.Dockerfile",
+        "context": ".."
+    },
+    "runArgs": [
+        "--device=/dev/dri",
+        "--group-add=video"
+    ],
+    "containerEnv": {
+        "DISPLAY": "${localEnv:DISPLAY}",
+        "WAYLAND_DISPLAY": ""
+    },
+    "mounts": [
+        "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"
+    ],
+    "initializeCommand": "xhost +local:docker || true",
+    "postCreateCommand": "mise trust && mise install && mise run setup",
+    "remoteUser": "ubuntu",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    }
+}

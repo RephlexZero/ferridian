@@ -1,0 +1,56 @@
+# Upstream breakage detection (§5): poll Mojang's version manifest every 6 h.
+# Exit 3 from `upstream-watch poll` means unseen versions exist.
+#
+# LEGAL GUARDRAIL: only *derived* signature inventories (names/signatures/
+# hashes) may ever be committed or attached to issues. Decompiled Mojang
+# source stays inside the CI job and is discarded with the runner.
+
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Poll Mojang version manifest
+        id: poll
+        run: |
+          set +e
+          cargo run -q -p upstream-watch -- poll | tee poll.txt
+          code=$?
+          set -e
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" != 0 ] && [ "$code" != 3 ]; then exit "$code"; fi
+      - name: Open tracking issue for new versions
+        if: steps.poll.outputs.exit == '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="upstream: new Minecraft version(s) detected"
+          body="$(cat poll.txt)
+
+          Next steps (M1 automation will do this itself):
+          1. Download the (unobfuscated) client jar in CI.
+          2. Decompile with Vineflower **in CI only** — never commit output.
+          3. Extract the derived signature inventory of tracked render classes.
+          4. \`upstream-watch diff\` against the committed inventory.
+          5. Regenerate the shim contract if signatures moved."
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+        # TODO(M1): decompile + inventory extraction + shim-regen PR draft,
+        # gated on goldens passing under the new jar.

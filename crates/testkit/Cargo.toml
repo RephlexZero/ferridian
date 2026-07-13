@@ -4,6 +4,7 @@ description = "GPU test harness: lavapipe bootstrap where validation errors fail
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

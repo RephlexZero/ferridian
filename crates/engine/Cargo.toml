@@ -4,6 +4,7 @@ description = "Render graph and frame orchestration (no Vulkan initialization li
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

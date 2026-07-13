@@ -1,0 +1,30 @@
+# Weekly fuzzing of untrusted-input parsers (§5). Pack manifests are the
+# first target; SPIR-V reflection input and the contract decoder join as they
+# grow parsing surface.
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz pack manifest parser (10 min)
+        working-directory: crates/pack-format
+        run: cargo +nightly fuzz run pack_manifest -- -max_total_time=600
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: crates/pack-format/fuzz/artifacts

@@ -4,6 +4,7 @@ description = "Shader-author CLI: build / validate / serve packs"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
