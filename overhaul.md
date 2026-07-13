@@ -1,7 +1,7 @@
 # Project Plan — Rust Vulkan Shader Engine for Minecraft: Java Edition
 
-**Working codename:** TBD (candidates: *Caustic*, *Umbra*, *Lumen* is taken by UE — pick before repo creation)
-**Author:** Jake · **Date:** 2026-07-13 · **Status:** Draft v1
+**Working codename:** ✅ **Ferridian** (decided 2026-07-13 — existing name and `io.ferridian` namespace kept; revisit is cheap later)
+**Author:** Jake · **Date:** 2026-07-13 · **Status:** Draft v1 · **M0 complete 2026-07-13** (commits `105e36d`…`140b01b`)
 
 ---
 
@@ -96,13 +96,13 @@ We do **not** compete for the "default shader loader" position (Aperture wins th
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Task runner / tool pinning | **mise** (`mise.toml`) | Pins JDK, lefthook, taplo, slang, etc. cross-OS; task runner included. No crate named `xtask` — logic-bearing tasks are real CLI crates in `tools/`. |
-| Rust pinning | `rust-toolchain.toml` | With mise, covers ~90% of hermeticity without containers on Windows. |
-| Git hooks | **lefthook**, <5 s budget | fmt check, typos, taplo, commit-lint only. Advisory UX; CI is the enforcement layer. Wired by `mise run setup`. |
-| Test runner | **cargo-nextest** | Parallelism, retries for rare lavapipe flakes, JUnit output. |
-| Snapshots | **insta** | SPIR-V reflection dumps + codegen output as reviewable snapshots. |
-| Supply chain | cargo-deny + **cargo-vet** + cargo-auditable + GitHub artifact attestations (SLSA) | We ship a cdylib injected next to people's game — verifiable builds are ethics *and* marketing. |
-| Deps/releases | Renovate + release-plz (conventional commits) | |
+| Task runner / tool pinning | ✅ **mise** (`mise.toml`) | Pins JDK, lefthook, taplo, slang, etc. cross-OS; task runner included. No crate named `xtask` — logic-bearing tasks are real CLI crates in `tools/`. |
+| Rust pinning | ✅ `rust-toolchain.toml` (1.96.0) | With mise, covers ~90% of hermeticity without containers on Windows. |
+| Git hooks | ✅ **lefthook**, <5 s budget | fmt check, typos, taplo, commit-lint only. Advisory UX; CI is the enforcement layer. Wired by `mise run setup`. |
+| Test runner | ✅ **cargo-nextest** | Parallelism, retries for rare lavapipe flakes, JUnit output. |
+| Snapshots | ✅ **insta** | SPIR-V reflection dumps + codegen output as reviewable snapshots. |
+| Supply chain | ⏳ cargo-deny ✅ + **cargo-vet** + cargo-auditable + GitHub artifact attestations (SLSA) | We ship a cdylib injected next to people's game — verifiable builds are ethics *and* marketing. *(deny wired and green; vet/auditable/attestations are M1+ follow-ups — see README checklist)* |
+| Deps/releases | ⏳ Renovate + release-plz (conventional commits) | *(commit-lint hook in place; bots not yet enabled)* |
 | Deliberately skipped (for now) | Nix, Bazel, cargo-hakari, OSS-Fuzz enrolment | Bloat at this stage; revisit at scale. |
 
 ### 4.3 Containers — final position
@@ -113,28 +113,30 @@ Exactly **one** image (`ci/mesa.Dockerfile`): pinned Mesa/lavapipe, pushed to GH
 - **Windows dev:** native, no container. Same `mise run *` commands. Its job: MSVC build + real Windows driver behaviour (untestable in a container anyway). **Never** WSL2-for-Vulkan (Dozen is incomplete and will mislead).
 - **CI:** container for render jobs; plain runners otherwise.
 
+> ✅ **Status:** `ci/mesa.Dockerfile` + devcontainer implemented and verified locally (Mesa 25.2.8, VVL 1.3.275, slangc 2026.13, lavapipe boots under VVL). `container.yml` pushes the GHCR pin on Dockerfile change; the CI gpu job builds the image inline until the first pushed tag exists.
+
 ---
 
 ## 5. CI / safety wiring
 
 **Per-PR (fast-fail order):**
-1. Lint: `fmt`, `clippy -D warnings` (workspace.lints), typos, taplo.
-2. Build+test matrix: `ubuntu-latest`, `windows-latest`, `macos-14` (Apple silicon) — nextest.
-3. Golden render job (pinned Mesa container): scene fixtures on lavapipe, **VVL enabled, any validation error = test failure**, perceptual diff (dssim-style tolerance) vs LFS baselines.
+1. ✅ Lint: `fmt`, `clippy -D warnings` (workspace.lints), typos, taplo.
+2. ✅ Build+test matrix: `ubuntu-latest`, `windows-latest`, `macos-14` (Apple silicon) — nextest. *(workflow in place; first hosted run pending push of the restructure)*
+3. ⏳ Golden render job (pinned Mesa container): scene fixtures on lavapipe, **VVL enabled, any validation error = test failure** ✅ *(testkit gate proven on lavapipe)*, perceptual diff (dssim-style tolerance) vs LFS baselines *(harness + baselines = M1)*.
 4. macOS leg: MoltenVK if runnable on GH macOS VMs; otherwise SwiftShader + static portability-subset capability lint against committed MoltenVK profile. *(Verify MoltenVK-on-runner early — open question.)*
-5. Gates: cargo-semver-checks (public crates), cargo-deny, cargo-vet.
+5. ⏳ Gates: cargo-semver-checks (public crates), cargo-deny ✅, cargo-vet.
 
-**Nightly:** sync validation + GPU-assisted validation (slow VVL modes); ASan/LSan on `vk-layer` (Linux); Miri on pure crates (`pack-format`, engine internals).
+**Nightly:** sync validation + GPU-assisted validation (slow VVL modes); ASan/LSan on `vk-layer` (Linux); Miri on pure crates (`pack-format`, engine internals). *(deferred to M1 — needs the render harness to be meaningful)*
 
-**Weekly:** cargo-fuzz targets — pack manifest parser, SPIR-V reflection input, contract decoder. (Parsers of untrusted packs are the attack surface.)
+**Weekly:** ⏳ cargo-fuzz targets — pack manifest parser ✅ (`fuzz.yml`, time-boxed), SPIR-V reflection input, contract decoder. (Parsers of untrusted packs are the attack surface.)
 
 **Upstream watch (6 h cron):**
-1. Poll Mojang `version_manifest_v2.json`.
-2. New snapshot → download jar (unobfuscated), decompile with Vineflower **in CI only**.
-3. Extract derived **signature inventory** of tracked render classes/methods; diff vs committed inventory.
-4. No diff → green tick on tracking issue. Diff → bot opens issue with signature-level report; Claude Code Action drafts shim-regen PR, gated on goldens passing under the new jar.
-5. **Legal guardrail:** commit only derived inventories (signatures/hashes) — never decompiled Mojang source in a public repo.
-6. Renovate watches Fabric Loader/API; Dependabot watches Vulkan-Headers/VVL releases.
+1. ✅ Poll Mojang `version_manifest_v2.json`. *(live-tested against the real manifest; `upstream-watch.yml` opens/comments issues on exit 3)*
+2. ⏳ New snapshot → download jar (unobfuscated), decompile with Vineflower **in CI only**. *(M1)*
+3. ⏳ Extract derived **signature inventory** of tracked render classes/methods; diff vs committed inventory. *(diff/report types + CLI in place; extraction = M1)*
+4. ⏳ No diff → green tick on tracking issue. Diff → bot opens issue with signature-level report ✅; Claude Code Action drafts shim-regen PR, gated on goldens passing under the new jar.
+5. ✅ **Legal guardrail:** commit only derived inventories (signatures/hashes) — never decompiled Mojang source in a public repo. *(stated in the workflow, upstream-watch docs, and architecture docs)*
+6. ⏳ Renovate watches Fabric Loader/API; Dependabot watches Vulkan-Headers/VVL releases. *(bots not yet enabled)*
 
 ---
 
@@ -167,14 +169,14 @@ Prove the engine on a real-world pack; give users a familiar look at launch; exe
 
 ## 7. Milestones
 
-| # | Milestone | Target | Exit criteria |
-|---|---|---|---|
-| M0 | Walking skeleton | +2 wk | Repo scaffold; `mise run ci` green on 3 OSes; testkit boots lavapipe and fails a test on a VVL error; mesa image + devcontainer live |
-| M1 | Safety net complete | +6 wk | Golden harness + baselines; upstream-watch opening issues on real snapshots; fuzz targets running |
-| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer |
-| M3 | Pack pipeline v0 | +16 wk | `packc` builds Slang pack → SPIR-V artifact; hot reload; reference pack renders (shadows + deferred + one volumetric) |
-| M4 | Photon port alpha | +24 wk | Permission secured; Photon-on-engine parity screenshots vs Iris/OpenGL reference goldens |
-| M5 | Public alpha | Aligned to Mojang's OpenGL-removal messaging (~late 2026/early 2027) | Reference pack showcase + Photon port + docs + verifiable release artifacts |
+| # | Milestone | Target | Exit criteria | Status |
+|---|---|---|---|---|
+| M0 | Walking skeleton | +2 wk | Repo scaffold; `mise run ci` green on 3 OSes; testkit boots lavapipe and fails a test on a VVL error; mesa image + devcontainer live | ✅ **2026-07-13** — scaffold per §4.1; VVL-failure gate proven on lavapipe in the container; ci green locally (3-OS matrix defined, first hosted run pending push) |
+| M1 | Safety net complete | +6 wk | Golden harness + baselines; upstream-watch opening issues on real snapshots; fuzz targets running | ⏳ partial: manifest fuzz target + upstream-watch poll/issue workflow exist; golden harness + decompile/inventory extraction outstanding |
+| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer | pass-through layer shell + loader negotiation done; interception/dispatch not started |
+| M3 | Pack pipeline v0 | +16 wk | `packc` builds Slang pack → SPIR-V artifact ✅; hot reload; reference pack renders (shadows + deferred + one volumetric) | `packc build/validate` work end-to-end on `packs/reference`; `serve` (hot reload) stubbed |
+| M4 | Photon port alpha | +24 wk | Permission secured; Photon-on-engine parity screenshots vs Iris/OpenGL reference goldens | not started — **permission email to sixthsurge is the next human action** |
+| M5 | Public alpha | Aligned to Mojang's OpenGL-removal messaging (~late 2026/early 2027) | Reference pack showcase + Photon port + docs + verifiable release artifacts | — |
 
 Cadence risk: 26.3/26.4 renderer churn will invalidate pass detection repeatedly until OpenGL removal — upstream-watch (M1) exists precisely to make this a 1-day chore, not a surprise.
 
@@ -196,6 +198,6 @@ Cadence risk: 26.3/26.4 renderer churn will invalidate pass detection repeatedly
 
 1. Confirm Vulkan layer injection works cleanly with the 26.2 experimental renderer on all three OS loaders (Windows registry / Linux manifest / macOS-MoltenVK path).
 2. MoltenVK on GitHub macOS runners — real render or capability-lint only?
-3. Slang maturity for the full pack surface vs GLSL-primary at launch — spike in M3.
+3. Slang maturity for the full pack surface vs GLSL-primary at launch — spike in M3. *(early signal good: slangc 2026.13 compiles the reference composite pass with clean rspirv reflection)*
 4. Aperture licence & format stability — monitor for a future import tool.
-5. Codename.
+5. ~~Codename.~~ ✅ Resolved: **Ferridian**.
