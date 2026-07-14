@@ -311,6 +311,10 @@ name = "ferridian-vk-layer"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ferridian-pack-compiler",
+ "ferridian-testkit",
+ "ferridian-vk-rt",
+ "libloading",
  "serde_json",
  "tracing",
 ]

@@ -52,6 +52,7 @@ impl TestGpu {
             app_name: "ferridian-testkit".to_owned(),
             enable_validation: true,
             prefer_software_device: true,
+            extra_layers: Vec::new(),
         })
         .expect("testkit requires a Vulkan ICD (lavapipe) and VK_LAYER_KHRONOS_validation");
         TestGpu {

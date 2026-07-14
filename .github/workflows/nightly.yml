@@ -75,7 +75,7 @@ jobs:
             -e FERRIDIAN_GPU_TESTS=1 \
             -e VK_LAYER_SETTINGS_PATH=/work/vk_layer_settings.txt \
             ferridian-mesa:ci \
-            bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit'
+            bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit -p ferridian-vk-layer'
       - name: Upload failing renders + heatmaps
         if: failure()
         uses: actions/upload-artifact@v4

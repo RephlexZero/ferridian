@@ -64,7 +64,7 @@ jobs:
           docker run --rm -v "$PWD:/work" -w /work \
             -e FERRIDIAN_GPU_TESTS=1 \
             ferridian-mesa:ci \
-            bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit'
+            bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit -p ferridian-vk-layer'
       - name: Upload failing renders + heatmaps
         if: failure()
         uses: actions/upload-artifact@v4

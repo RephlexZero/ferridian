@@ -23,6 +23,10 @@ pub struct RuntimeOptions {
     pub enable_validation: bool,
     /// Prefer a CPU (software) device — lavapipe in the CI container.
     pub prefer_software_device: bool,
+    /// Additional explicit layers to enable (e.g. the Ferridian layer under
+    /// test, discovered via `VK_LAYER_PATH`). Each must be installed; a
+    /// missing layer is an error, not a silent skip.
+    pub extra_layers: Vec<String>,
 }
 
 impl Default for RuntimeOptions {
@@ -31,6 +35,7 @@ impl Default for RuntimeOptions {
             app_name: "ferridian".to_owned(),
             enable_validation: false,
             prefer_software_device: false,
+            extra_layers: Vec::new(),
         }
     }
 }
@@ -43,6 +48,10 @@ pub enum RuntimeError {
     Vk(#[from] vk::Result),
     #[error("validation was requested but VK_LAYER_KHRONOS_validation is not installed")]
     ValidationUnavailable,
+    #[error("requested layer {0} is not installed (is VK_LAYER_PATH set?)")]
+    LayerUnavailable(String),
+    #[error("layer name {0:?} contains an interior NUL byte")]
+    BadLayerName(String),
     #[error("no Vulkan physical device offers a graphics queue")]
     NoSuitableDevice,
     #[error("app name contains an interior NUL byte")]
@@ -81,13 +90,31 @@ impl VkRuntime {
 
         let mut layers: Vec<*const c_char> = Vec::new();
         let mut extensions: Vec<*const c_char> = Vec::new();
+        let installed = installed_layers(&entry)?;
         if options.enable_validation {
-            if !has_validation_layer(&entry)? {
+            if !installed
+                .iter()
+                .any(|name| name == "VK_LAYER_KHRONOS_validation")
+            {
                 return Err(RuntimeError::ValidationUnavailable);
             }
             layers.push(VALIDATION_LAYER.as_ptr());
             extensions.push(debug_utils::NAME.as_ptr());
         }
+        let extra_layers: Vec<CString> = options
+            .extra_layers
+            .iter()
+            .map(|name| {
+                if !installed
+                    .iter()
+                    .any(|installed_name| installed_name == name)
+                {
+                    return Err(RuntimeError::LayerUnavailable(name.clone()));
+                }
+                CString::new(name.clone()).map_err(|_| RuntimeError::BadLayerName(name.clone()))
+            })
+            .collect::<Result<_, _>>()?;
+        layers.extend(extra_layers.iter().map(|name| name.as_ptr()));
 
         let validation_messages: Arc<Mutex<Vec<String>>> = Arc::default();
 
@@ -236,14 +263,18 @@ impl Drop for VkRuntime {
     }
 }
 
-fn has_validation_layer(entry: &ash::Entry) -> Result<bool, RuntimeError> {
+fn installed_layers(entry: &ash::Entry) -> Result<Vec<String>, RuntimeError> {
     // SAFETY: plain enumeration; no preconditions beyond a loaded entry.
     let layers = unsafe { entry.enumerate_instance_layer_properties()? };
-    Ok(layers.iter().any(|layer| {
-        layer
-            .layer_name_as_c_str()
-            .is_ok_and(|name| name == VALIDATION_LAYER)
-    }))
+    Ok(layers
+        .iter()
+        .filter_map(|layer| {
+            layer
+                .layer_name_as_c_str()
+                .ok()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect())
 }
 
 fn pick_device(

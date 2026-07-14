@@ -31,6 +31,24 @@ static NEXT_GIPA: Mutex<Option<vk::PFN_vkGetInstanceProcAddr>> = Mutex::new(None
 static NEXT_GDPA: Mutex<Option<vk::PFN_vkGetDeviceProcAddr>> = Mutex::new(None);
 static INSTANCE: Mutex<vk::Instance> = Mutex::new(vk::Instance::null());
 
+type PfnCmdBeginRenderPass = for<'a> unsafe extern "system" fn(
+    vk::CommandBuffer,
+    *const vk::RenderPassBeginInfo<'a>,
+    vk::SubpassContents,
+);
+
+/// Down-chain `vkCmdBeginRenderPass`, captured the first time the loader (or
+/// an upper layer) queries it through our GDPA.
+static NEXT_CMD_BEGIN_RENDER_PASS: Mutex<Option<PfnCmdBeginRenderPass>> = Mutex::new(None);
+
+/// Render passes begun through the layer, readable across the cdylib
+/// boundary (tests dlopen the layer and assert interception actually
+/// happened; the count is Relaxed-accurate, which is all a probe needs).
+#[unsafe(no_mangle)]
+pub extern "system" fn ferridian_layer_render_pass_count() -> u64 {
+    hooks::render_pass_count()
+}
+
 /// Entry point named in the layer JSON manifest; the loader calls this first.
 ///
 /// # Safety
@@ -121,17 +139,60 @@ pub unsafe extern "system" fn ferridian_get_device_proc_addr(
     }
     // SAFETY: caller guarantees a NUL-terminated string per the Vulkan spec.
     let name = unsafe { CStr::from_ptr(p_name) };
-    if name.to_bytes() == b"vkGetDeviceProcAddr" {
-        // SAFETY: transmuting a fn pointer to the erased PFN_vkVoidFunction.
-        return Some(unsafe {
-            std::mem::transmute::<vk::PFN_vkGetDeviceProcAddr, unsafe extern "system" fn()>(
-                ferridian_get_device_proc_addr,
-            )
-        });
+    match name.to_bytes() {
+        b"vkGetDeviceProcAddr" => {
+            // SAFETY: transmuting a fn pointer to the erased PFN_vkVoidFunction.
+            Some(unsafe {
+                std::mem::transmute::<vk::PFN_vkGetDeviceProcAddr, unsafe extern "system" fn()>(
+                    ferridian_get_device_proc_addr,
+                )
+            })
+        }
+        b"vkCmdBeginRenderPass" => {
+            let next = *NEXT_GDPA.lock().expect("layer state lock poisoned");
+            // SAFETY: querying the down-chain pointer we will forward to.
+            let next_begin = next.and_then(|gdpa| unsafe { gdpa(device, p_name) })?;
+            // SAFETY: the down-chain vkCmdBeginRenderPass has exactly this type.
+            let next_begin = unsafe {
+                std::mem::transmute::<unsafe extern "system" fn(), PfnCmdBeginRenderPass>(
+                    next_begin,
+                )
+            };
+            *NEXT_CMD_BEGIN_RENDER_PASS
+                .lock()
+                .expect("layer state lock poisoned") = Some(next_begin);
+            // SAFETY: transmuting our hook to the erased PFN_vkVoidFunction.
+            Some(unsafe {
+                std::mem::transmute::<PfnCmdBeginRenderPass, unsafe extern "system" fn()>(
+                    ferridian_cmd_begin_render_pass,
+                )
+            })
+        }
+        _ => {
+            let next = *NEXT_GDPA.lock().expect("layer state lock poisoned");
+            // SAFETY: forwarding the unmodified query down the chain.
+            next.and_then(|gdpa| unsafe { gdpa(device, p_name) })
+        }
     }
-    let next = *NEXT_GDPA.lock().expect("layer state lock poisoned");
-    // SAFETY: forwarding the unmodified query down the chain.
-    next.and_then(|gdpa| unsafe { gdpa(device, p_name) })
+}
+
+/// # Safety
+/// Standard `vkCmdBeginRenderPass` contract; called by the dispatch chain
+/// only after our GDPA handed this pointer out (which also captured the
+/// down-chain pointer it forwards to).
+unsafe extern "system" fn ferridian_cmd_begin_render_pass(
+    command_buffer: vk::CommandBuffer,
+    p_render_pass_begin: *const vk::RenderPassBeginInfo<'_>,
+    contents: vk::SubpassContents,
+) {
+    hooks::render_pass_begun();
+    let next = *NEXT_CMD_BEGIN_RENDER_PASS
+        .lock()
+        .expect("layer state lock poisoned");
+    if let Some(next) = next {
+        // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+        unsafe { next(command_buffer, p_render_pass_begin, contents) };
+    }
 }
 
 /// # Safety
