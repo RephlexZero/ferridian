@@ -45,26 +45,32 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M1 safety net complete, M2 started
+## Status: M2 in-container scope complete; M3 hot reload landed
 
 M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
 blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
 jar→classfile-signature extraction live-tested against real 26.2/26.3 jars
 (it caught Mojang's `blaze3d`→`renderpearl` move in the 26.3 snapshots),
 four fuzz targets (which evicted panicky rspirv from the untrusted path),
-and a nightly Miri/ASan/sync-validation workflow. M2 has its first real
-interception: the layer loads under the real Vulkan loader beneath VVL and
-counts `vkCmdBeginRenderPass`, proven by a GPU-gated end-to-end test.
+and a nightly Miri/ASan/sync-validation workflow.
+
+M2, everything provable without a live game: the layer runs under the real
+Vulkan loader beneath VVL with per-object dispatch tables (proven with two
+concurrent instance+device stacks), intercepts debug-utils labels and
+classifies render passes against the contract's anchors, and **composites
+its own draw inside the game's render pass** — pixel-verified, and only
+into classified passes; Unknown is forwarded untouched. M3's hot reload v0:
+`packc serve` watches, rebuilds, and atomically publishes artifact
+generations. The Fabric shim builds against live Maven (MC 26.2, loader
+0.19.3, Loom 1.17.14, JDK 25) and CI rejects contract/codegen drift.
 
 Follow-ups tracked toward M2+:
 
-- [ ] vk-layer: per-object dispatch tables, then injection into a real game process (M2)
-- [ ] Engine composite over the intercepted frame; pass detection via the contract (M2)
-- [ ] packc `serve` hot reload (M3)
-- [ ] Verify shim Gradle/Loom versions against live Maven; wire `shim-build` into CI
+- [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
+- [ ] Engine-side consumption of `packc serve` generations (M3)
+- [ ] Reference pack buildout: shadows + deferred + one volumetric (M3)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
-- [ ] Renovate/Dependabot for Fabric Loader/API + Vulkan-Headers/VVL bumps
 - [ ] GPU-assisted validation in nightly once verified against lavapipe
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
 - [ ] Photon port permission outreach (human task, before any port work)

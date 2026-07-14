@@ -102,7 +102,7 @@ We do **not** compete for the "default shader loader" position (Aperture wins th
 | Test runner | ✅ **cargo-nextest** | Parallelism, retries for rare lavapipe flakes, JUnit output. |
 | Snapshots | ✅ **insta** | SPIR-V reflection dumps + codegen output as reviewable snapshots. |
 | Supply chain | ⏳ cargo-deny ✅ + **cargo-vet** + cargo-auditable + GitHub artifact attestations (SLSA) | We ship a cdylib injected next to people's game — verifiable builds are ethics *and* marketing. *(deny wired and green; vet/auditable/attestations are M1+ follow-ups — see README checklist)* |
-| Deps/releases | ⏳ Renovate + release-plz (conventional commits) | *(commit-lint hook in place; bots not yet enabled)* |
+| Deps/releases | ⏳ Dependabot (cargo/gradle/actions, grouped weekly) ✅; release-plz pending | *(commit-lint hook in place; `.github/dependabot.yml` activates on push)* |
 | Deliberately skipped (for now) | Nix, Bazel, cargo-hakari, OSS-Fuzz enrolment | Bloat at this stage; revisit at scale. |
 
 ### 4.3 Containers — final position
@@ -136,7 +136,7 @@ Exactly **one** image (`ci/mesa.Dockerfile`): pinned Mesa/lavapipe, pushed to GH
 3. ✅ Extract derived **signature inventory** of tracked render classes/methods; diff vs committed inventory. *(2026-07-14: 26.2 baseline committed — 18 classes across `blaze3d.vulkan`, `blaze3d.systems`, `client.renderer`. Live diff against 26.3-snapshot-3 correctly caught Mojang moving the GPU stack to `com.mojang.renderpearl` — the exact churn class this exists for.)*
 4. ⏳ Diff report lands on the tracking issue ✅ (fetch→extract→diff wired into the workflow); Claude Code Action drafting a shim-regen PR gated on goldens = still to come.
 5. ✅ **Legal guardrail:** commit only derived inventories (signatures/hashes) — never decompiled Mojang source in a public repo. *(now enforced by construction: nothing in the pipeline can emit source)*
-6. ⏳ Renovate watches Fabric Loader/API; Dependabot watches Vulkan-Headers/VVL releases. *(bots not yet enabled)*
+6. ✅ Dependabot watches cargo, the shim's Gradle deps (Fabric Loader/Loom), and workflow actions — grouped weekly PRs judged by the full safety net. Mesa/VVL stay pinned via the container image by design.
 
 ---
 
@@ -173,8 +173,8 @@ Prove the engine on a real-world pack; give users a familiar look at launch; exe
 |---|---|---|---|---|
 | M0 | Walking skeleton | +2 wk | Repo scaffold; `mise run ci` green on 3 OSes; testkit boots lavapipe and fails a test on a VVL error; mesa image + devcontainer live | ✅ **2026-07-13** — scaffold per §4.1; VVL-failure gate proven on lavapipe in the container; ci green locally (3-OS matrix defined, first hosted run pending push) |
 | M1 | Safety net complete | +6 wk | Golden harness + baselines; upstream-watch opening issues on real snapshots; fuzz targets running | ✅ **2026-07-14** — golden harness + first blessed baseline (in-container); fetch→extract→diff live-tested against real 26.2/26.3 jars and wired into the issue workflow; four fuzz targets (one real rspirv panic found + fixed). Hosted runs of the workflows pending push |
-| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer | ⏳ started 2026-07-14: layer loads under the **real Vulkan loader** on lavapipe beneath VVL (manifest + VK_LAYER_PATH), and intercepts `vkCmdBeginRenderPass` (counted, forwarded, validation-clean, proven by GPU-gated test). Next: per-object dispatch tables, game-process injection, composite-over-frame |
-| M3 | Pack pipeline v0 | +16 wk | `packc` builds Slang pack → SPIR-V artifact ✅; hot reload; reference pack renders (shadows + deferred + one volumetric) | `packc build/validate` work end-to-end on `packs/reference`; `serve` (hot reload) stubbed |
+| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer | ⏳ in-container scope done 2026-07-14: per-object dispatch tables (dispatch-key keyed, destroy-clean, proven with two concurrent instance+device stacks); debug-utils label interception classifying passes against contract anchors; **composite over the intercepted frame** (embedded overlay drawn inside the app's render pass, pixel-verified, only into classified passes) — all beneath VVL with zero messages. Remaining needs a real game: process injection + live anchors from Blaze3D's actual debug groups |
+| M3 | Pack pipeline v0 | +16 wk | `packc` builds Slang pack → SPIR-V artifact ✅; hot reload; reference pack renders (shadows + deferred + one volumetric) | `packc build/validate` work end-to-end on `packs/reference`; `serve` (hot reload v0) watches, rebuilds, and publishes atomic generations — live-verified edit→rebuild→recover cycle 2026-07-14. Remaining: engine-side consumption; reference pack buildout |
 | M4 | Photon port alpha | +24 wk | Permission secured; Photon-on-engine parity screenshots vs Iris/OpenGL reference goldens | not started — **permission email to sixthsurge is the next human action** |
 | M5 | Public alpha | Aligned to Mojang's OpenGL-removal messaging (~late 2026/early 2027) | Reference pack showcase + Photon port + docs + verifiable release artifacts | — |
 

@@ -1,0 +1,33 @@
+# Dependency bumps as PRs, so the full safety net (goldens, VVL, fuzz
+# corpora, shim-vs-live-Maven) judges every upgrade instead of a human
+# guessing. Grouped weekly: one PR per ecosystem, not twenty.
+#
+# Not covered here by design: Mesa/VVL (pinned via the pushed container
+# image — bumping is a deliberate rebuild + re-bless, see goldens/README.md)
+# and the Minecraft version itself (upstream-watch owns that signal).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+
+  # Fabric Loader / Loom / any future Fabric API dep.
+  - package-ecosystem: gradle
+    directory: /shim
+    schedule:
+      interval: weekly
+    groups:
+      fabric-toolchain:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      workflow-actions:
+        patterns: ["*"]
