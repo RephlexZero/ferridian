@@ -3,9 +3,11 @@
 //! compiled artifact.
 
 mod reflection;
+mod serve;
 mod slang;
 
 pub use reflection::{BindingReflection, EntryPointReflection, ShaderReflection, reflect_spirv};
+pub use serve::{SourceSnapshot, read_generation, write_generation};
 pub use slang::{SlangCompiler, resolve_slangc};
 
 use std::fs;
