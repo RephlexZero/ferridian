@@ -55,3 +55,23 @@ fn reflects_entry_points_and_bindings() {
 fn rejects_garbage() {
     assert!(reflect_spirv(&[0xdead_beef, 0x0bad_f00d]).is_err());
 }
+
+/// Fuzz-found regressions: rspirv 0.12's decoder *panics* on these inputs
+/// (out-of-bounds slice on a truncated instruction; explicit panic on an
+/// unknown enum operand), which is why reflection walks the words itself.
+/// Tampered pack artifacts reach this code, so whatever the verdict, it must
+/// come back as a value — this test simply must not panic.
+#[test]
+fn fuzz_crash_inputs_return_verdicts_instead_of_panicking() {
+    for fixture in [
+        &include_bytes!("fixtures/fuzz-truncated-instruction-1.spv")[..],
+        &include_bytes!("fixtures/fuzz-truncated-instruction-2.spv")[..],
+        &include_bytes!("fixtures/fuzz-truncated-instruction-3.spv")[..],
+    ] {
+        let words: Vec<u32> = fixture
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        let _ = reflect_spirv(&words);
+    }
+}

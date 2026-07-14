@@ -1,0 +1,85 @@
+# Nightly deep checks (§5): the slow tools that would blow the per-PR budget.
+# Failures here are investigation tickets, not merge blockers.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Miri on the pure crates — UB detection where the code is Miri-able by
+  # design (no Vulkan, no I/O in unit tests).
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - run: >
+          cargo +nightly miri test
+          -p ferridian-pack-format
+          -p ferridian-engine
+          -p ferridian-contract
+
+  # AddressSanitizer + LeakSanitizer on the layer + runtime tests: the cdylib
+  # is the code we inject next to people's game, leaks and UAFs included.
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+      - name: Tests under ASan/LSan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        run: >
+          cargo +nightly test
+          -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p ferridian-vk-layer
+          -p ferridian-vk-rt
+          -p ferridian-engine
+
+  # Synchronization validation on lavapipe: the slow VVL mode that catches
+  # hazard bugs plain validation misses. GPU-assisted validation joins once
+  # its lavapipe support is verified.
+  sync-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - name: Build pinned Mesa image
+        run: docker build -f ci/mesa.Dockerfile -t ferridian-mesa:ci .
+      - name: GPU tests with sync validation (any message fails)
+        run: |
+          cat > vk_layer_settings.txt <<'EOF'
+          khronos_validation.validate_sync = true
+          khronos_validation.syncval_shader_accesses_heuristic = true
+          EOF
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e FERRIDIAN_GPU_TESTS=1 \
+            -e VK_LAYER_SETTINGS_PATH=/work/vk_layer_settings.txt \
+            ferridian-mesa:ci \
+            bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit'
+      - name: Upload failing renders + heatmaps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-golden-failures
+          path: target/golden-failures/
+          if-no-files-found: ignore

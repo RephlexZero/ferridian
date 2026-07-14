@@ -301,6 +301,23 @@ fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
 /// (possible — jars are untrusted) renders as `?` rather than erroring: the
 /// inventory diff still works on it.
 fn render_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    // Array dimensions iteratively: a hostile descriptor can nest `[` far
+    // deeper than the JVM's 255 limit, so recursing per dimension would let
+    // untrusted input pick our stack depth.
+    let mut dimensions = 0usize;
+    while chars.peek() == Some(&'[') {
+        chars.next();
+        dimensions += 1;
+    }
+    let mut rendered = render_scalar_type(chars);
+    rendered.reserve(dimensions * 2);
+    for _ in 0..dimensions {
+        rendered.push_str("[]");
+    }
+    rendered
+}
+
+fn render_scalar_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     match chars.next() {
         Some('B') => "byte".to_owned(),
         Some('C') => "char".to_owned(),
@@ -321,7 +338,6 @@ fn render_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
             }
             name
         }
-        Some('[') => format!("{}[]", render_type(chars)),
         _ => "?".to_owned(),
     }
 }
@@ -364,6 +380,20 @@ mod tests {
             descriptor: "[[J".to_owned(),
         };
         assert_eq!(render_field(&member), "private final long[][] frames");
+    }
+
+    #[test]
+    fn hostile_array_nesting_does_not_recurse() {
+        // 100k dimensions must not blow the stack (JVM caps at 255; hostile
+        // jars don't care about caps).
+        let member = Member {
+            access_flags: 0,
+            name: "deep".to_owned(),
+            descriptor: format!("{}I", "[".repeat(100_000)),
+        };
+        let rendered = render_field(&member);
+        assert!(rendered.starts_with("int[]"));
+        assert_eq!(rendered.matches("[]").count(), 100_000);
     }
 
     #[test]

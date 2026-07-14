@@ -11,7 +11,12 @@ members = [
   "tools/shim-codegen",
   "tools/upstream-watch",
 ]
-exclude = ["crates/pack-format/fuzz"]
+exclude = [
+  "crates/contract/fuzz",
+  "crates/pack-compiler/fuzz",
+  "crates/pack-format/fuzz",
+  "tools/upstream-watch/fuzz",
+]
 resolver = "2"
 
 [workspace.package]

@@ -1,8 +1,8 @@
 # cargo-fuzz crate (nightly-only, excluded from the workspace).
-# Run: cargo +nightly fuzz run pack_manifest  (from crates/pack-format)
+# Run: cargo +nightly fuzz run spirv_reflection  (from crates/pack-compiler)
 
 [package]
-name = "ferridian-pack-format-fuzz"
+name = "ferridian-pack-compiler-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -15,11 +15,11 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ferridian-pack-format = { path = ".." }
+ferridian-pack-compiler = { path = ".." }
 
 [[bin]]
-name = "pack_manifest"
-path = "fuzz_targets/pack_manifest.rs"
+name = "spirv_reflection"
+path = "fuzz_targets/spirv_reflection.rs"
 test = false
 doc = false
 bench = false

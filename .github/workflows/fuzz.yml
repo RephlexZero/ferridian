@@ -1,6 +1,6 @@
-# Weekly fuzzing of untrusted-input parsers (§5). Pack manifests are the
-# first target; SPIR-V reflection input and the contract decoder join as they
-# grow parsing surface.
+# Weekly fuzzing of untrusted-input parsers (§5): pack manifests, SPIR-V
+# reflection, the Java<->Rust contract decoder, and the classfile parser that
+# reads Mojang jars. Time-boxed per target; any crash uploads its artifact.
 
 name: fuzz
 
@@ -11,20 +11,34 @@ on:
 
 jobs:
   fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: crates/pack-format
+            target: pack_manifest
+          - crate: crates/pack-compiler
+            target: spirv_reflection
+          - crate: crates/contract
+            target: contract_decode
+          - crate: tools/upstream-watch
+            target: classfile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: Fuzz pack manifest parser (10 min)
-        working-directory: crates/pack-format
-        run: cargo +nightly fuzz run pack_manifest -- -max_total_time=600
+      - name: Fuzz ${{ matrix.target }} (10 min)
+        working-directory: ${{ matrix.crate }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
-          path: crates/pack-format/fuzz/artifacts
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: ${{ matrix.crate }}/fuzz/artifacts

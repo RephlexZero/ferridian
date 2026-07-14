@@ -1,8 +1,8 @@
 # cargo-fuzz crate (nightly-only, excluded from the workspace).
-# Run: cargo +nightly fuzz run pack_manifest  (from crates/pack-format)
+# Run: cargo +nightly fuzz run classfile  (from tools/upstream-watch)
 
 [package]
-name = "ferridian-pack-format-fuzz"
+name = "upstream-watch-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -15,11 +15,11 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ferridian-pack-format = { path = ".." }
+upstream-watch = { path = ".." }
 
 [[bin]]
-name = "pack_manifest"
-path = "fuzz_targets/pack_manifest.rs"
+name = "classfile"
+path = "fuzz_targets/classfile.rs"
 test = false
 doc = false
 bench = false
