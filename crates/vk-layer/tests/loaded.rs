@@ -66,10 +66,16 @@ fn stage_layer() -> (PathBuf, PathBuf) {
     // VK_LAYER_PATH *replaces* the loader's explicit-layer search path, so it
     // must also cover wherever the validation layer lives (any existing
     // setting, else the standard system dir the CI image installs VVL into).
+    // The existing setting may itself already be a multi-entry PATH-style
+    // list, so split it back into individual paths before rejoining — passing
+    // it through as one opaque entry makes join_paths reject the embedded
+    // separator.
     let system_layers = std::env::var("VK_LAYER_PATH")
         .unwrap_or_else(|_| "/usr/share/vulkan/explicit_layer.d".to_owned());
-    let layer_path = std::env::join_paths([manifest_dir.as_path(), system_layers.as_ref()])
-        .expect("join VK_LAYER_PATH entries");
+    let layer_path = std::env::join_paths(
+        std::iter::once(manifest_dir.clone()).chain(std::env::split_paths(&system_layers)),
+    )
+    .expect("join VK_LAYER_PATH entries");
     // SAFETY: nextest gives this test its own process; nothing else is
     // reading the environment concurrently.
     unsafe { std::env::set_var("VK_LAYER_PATH", layer_path) };
