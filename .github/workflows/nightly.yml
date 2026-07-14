@@ -17,7 +17,7 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -35,7 +35,7 @@ jobs:
   asan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -60,7 +60,7 @@ jobs:
   sync-validation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           lfs: true
       - name: Build pinned Mesa image
@@ -78,7 +78,7 @@ jobs:
             bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit -p ferridian-vk-layer'
       - name: Upload failing renders + heatmaps
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-golden-failures
           path: target/golden-failures/

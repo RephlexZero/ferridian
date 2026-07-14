@@ -4,6 +4,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::CompileError;
 
@@ -84,13 +85,16 @@ impl SlangCompiler {
 }
 
 fn tempfile_path(pass: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let sanitized: String = pass
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     env::temp_dir().join(format!(
-        "ferridian-packc-{}-{}.spv",
+        "ferridian-packc-{}-{}-{}.spv",
         std::process::id(),
+        unique,
         sanitized
     ))
 }
