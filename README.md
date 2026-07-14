@@ -45,7 +45,7 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M2 in-container scope complete; M3 done — the reference pack executes on device
+## Status: M3 done and the layer↔executor seam closed — the layer runs loaded packs over intercepted frames
 
 M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
 blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
@@ -72,14 +72,24 @@ plan (intermediate images, descriptor sets, one fullscreen pipeline per pass)
 and replays the schedule writers-before-readers. The four-pass reference pack
 — screen-space shadows → deferred lighting → volumetric fog → composite —
 runs end to end on lavapipe under validation: synthetic game frames in,
-correctly lit and fogged pixels out, deterministic across replays. The
-Fabric shim builds against live Maven (MC 26.2, loader 0.19.3, Loom 1.17.14,
-JDK 25) and CI rejects contract/codegen drift.
+correctly lit and fogged pixels out, deterministic across replays. And the
+layer↔executor seam is closed: with a pack artifact armed (`FERRIDIAN_PACK`),
+the layer tracks the app's views/framebuffers/render passes, and at the end
+of the world-final classified pass taps its color+depth attachments, runs
+the pack over them (`vk-rt::PackCompositor`), and writes the composite back
+into the app's own color attachment — later passes (hand, GUI) draw on top
+untouched, the embedded overlay is replaced outright, and attachment
+turnover (resize-shaped) invalidates and rebuilds cleanly. Proven end to end
+on the real loader: the reference pack lights and fogs an intercepted
+game-shaped frame, non-trigger and Unknown passes come back byte-identical.
+The Fabric shim builds against live Maven (MC 26.2, loader 0.19.3, Loom
+1.17.14, JDK 25) and CI rejects contract/codegen drift.
 
 Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Layer↔executor integration: run the executor over the intercepted frame's taps instead of the embedded overlay (M4 seam)
+- [ ] Layer-side pack hot reload: drive the compositor from `PackWatcher` (executor teardown/rebuild is already invalidation-driven; needs a safe per-frame swap point)
+- [ ] Real-game attachment tapping: intercept `vkCreateImage` to force `TRANSFER_SRC` on attachment usage, and cover `vkCreateRenderPass2`/dynamic rendering (only the classic render-pass path is intercepted today)
 - [ ] Executor v1: compute passes, uniform buffers (contract camera), multiple render targets, gpu-allocator
 - [ ] Reference pack: swap the placeholder camera model for real contract uniforms; golden-image the four passes
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
