@@ -28,6 +28,12 @@ pub const SWAPCHAIN: &str = "swapchain";
 /// captures them from the game.
 pub const EXTERNAL_INPUTS: [&str; 2] = ["game_color", "game_depth"];
 
+/// The one uniform block packs may bind: the contract's per-frame camera
+/// (`ferridian_contract::CameraUniforms`, std140). It is engine state, not a
+/// graph resource — passes bind it as `ConstantBuffer<Camera> camera` without
+/// declaring it in `inputs`, and the executor owns the buffer.
+pub const CAMERA: &str = "camera";
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WireError {
     #[error("pass {pass}: module failed reflection: {message}")]
@@ -59,13 +65,19 @@ pub enum WireError {
         set: u32,
     },
     #[error(
-        "pass {pass}: binding {name:?} is {storage_class}; only combined image samplers (UniformConstant) are wireable yet"
+        "pass {pass}: binding {name:?} is {storage_class}; only combined image samplers (UniformConstant) and the {CAMERA:?} uniform block are wireable yet"
     )]
     UnsupportedStorageClass {
         pass: String,
         name: String,
         storage_class: String,
     },
+    #[error(
+        "pass {pass}: uniform block {name:?} is not a builtin; only the contract {CAMERA:?} block is wireable yet"
+    )]
+    UnknownUniformBlock { pass: String, name: String },
+    #[error("pass {pass}: the {CAMERA:?} block is bound twice")]
+    DuplicateCameraBinding { pass: String },
     #[error("pass {pass}: descriptor slot {binding} is bound twice")]
     DuplicateBindingSlot { pass: String, binding: u32 },
     #[error("pass {pass}: binding {name:?} matches none of the pass's declared inputs")]
@@ -91,6 +103,9 @@ pub struct PassPlan {
     pub fragment_entry: String,
     /// Sorted by binding slot.
     pub bindings: Vec<BindingPlan>,
+    /// Descriptor slot of the [`CAMERA`] uniform block, when the pass binds
+    /// it. Never collides with a sampler slot in `bindings`.
+    pub camera_binding: Option<u32>,
     pub output: ResourceId,
 }
 
@@ -165,6 +180,7 @@ pub fn plan_with_reflections(
         let fragment_entry = single_stage_entry(reflection, "Fragment", &pass.name)?;
 
         let mut bindings = Vec::with_capacity(reflection.bindings.len());
+        let mut camera_binding = None;
         let mut used_slots = BTreeSet::new();
         let mut bound_inputs = BTreeSet::new();
         for reflected in &reflection.bindings {
@@ -182,12 +198,37 @@ pub fn plan_with_reflections(
                     set: reflected.set,
                 });
             }
-            if reflected.storage_class != "UniformConstant" {
-                return Err(WireError::UnsupportedStorageClass {
-                    pass: err_pass(),
-                    name: name.to_owned(),
-                    storage_class: reflected.storage_class.clone(),
-                });
+            match reflected.storage_class.as_str() {
+                "UniformConstant" => {}
+                // A uniform block: engine state, not a graph resource — only
+                // the contract camera exists, and it bypasses the
+                // declared-inputs check below.
+                "Uniform" => {
+                    if name != CAMERA {
+                        return Err(WireError::UnknownUniformBlock {
+                            pass: err_pass(),
+                            name: name.to_owned(),
+                        });
+                    }
+                    if camera_binding.is_some() {
+                        return Err(WireError::DuplicateCameraBinding { pass: err_pass() });
+                    }
+                    if !used_slots.insert(reflected.binding) {
+                        return Err(WireError::DuplicateBindingSlot {
+                            pass: err_pass(),
+                            binding: reflected.binding,
+                        });
+                    }
+                    camera_binding = Some(reflected.binding);
+                    continue;
+                }
+                _ => {
+                    return Err(WireError::UnsupportedStorageClass {
+                        pass: err_pass(),
+                        name: name.to_owned(),
+                        storage_class: reflected.storage_class.clone(),
+                    });
+                }
             }
             if !used_slots.insert(reflected.binding) {
                 return Err(WireError::DuplicateBindingSlot {
@@ -225,6 +266,7 @@ pub fn plan_with_reflections(
             vertex_entry,
             fragment_entry,
             bindings,
+            camera_binding,
             output: ResourceId(output.to_owned()),
         });
     }
@@ -305,6 +347,15 @@ mod tests {
         }
     }
 
+    fn uniform(binding: u32, name: &str) -> BindingReflection {
+        BindingReflection {
+            set: 0,
+            binding,
+            storage_class: "Uniform".to_owned(),
+            name: Some(name.to_owned()),
+        }
+    }
+
     fn reflection(bindings: Vec<BindingReflection>) -> ShaderReflection {
         ShaderReflection {
             entry_points: stages(),
@@ -368,6 +419,77 @@ mod tests {
             vec![(0, "game_color"), (1, "game_depth"), (2, "shadow_mask")]
         );
         assert_eq!(plan.passes[2].output, ResourceId("swapchain".into()));
+    }
+
+    #[test]
+    fn wires_the_camera_block_without_declaring_it_as_an_input() {
+        let mut reflections = reference_reflections();
+        reflections.insert(
+            "shadows".to_owned(),
+            reflection(vec![sampler(0, 0, "game_depth"), uniform(7, "camera")]),
+        );
+        let plan = plan(&reference_shaped(), &reflections).unwrap();
+        assert_eq!(plan.passes[0].camera_binding, Some(7));
+        // Passes that don't bind it stay camera-free.
+        assert_eq!(plan.passes[1].camera_binding, None);
+        // The camera never appears as a wired image resource.
+        assert!(
+            plan.passes[0]
+                .bindings
+                .iter()
+                .all(|binding| binding.resource.0 != CAMERA)
+        );
+    }
+
+    #[test]
+    fn rejects_uniform_blocks_that_are_not_the_camera() {
+        let mut reflections = reference_reflections();
+        reflections.insert(
+            "shadows".to_owned(),
+            reflection(vec![
+                sampler(0, 0, "game_depth"),
+                uniform(7, "scene_uniforms"),
+            ]),
+        );
+        assert_eq!(
+            plan(&reference_shaped(), &reflections),
+            Err(WireError::UnknownUniformBlock {
+                pass: "shadows".to_owned(),
+                name: "scene_uniforms".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_camera_bound_twice_or_on_a_taken_slot() {
+        let mut reflections = reference_reflections();
+        reflections.insert(
+            "shadows".to_owned(),
+            reflection(vec![
+                sampler(0, 0, "game_depth"),
+                uniform(6, "camera"),
+                uniform(7, "camera"),
+            ]),
+        );
+        assert_eq!(
+            plan(&reference_shaped(), &reflections),
+            Err(WireError::DuplicateCameraBinding {
+                pass: "shadows".to_owned(),
+            })
+        );
+
+        let mut reflections = reference_reflections();
+        reflections.insert(
+            "shadows".to_owned(),
+            reflection(vec![sampler(0, 0, "game_depth"), uniform(0, "camera")]),
+        );
+        assert_eq!(
+            plan(&reference_shaped(), &reflections),
+            Err(WireError::DuplicateBindingSlot {
+                pass: "shadows".to_owned(),
+                binding: 0,
+            })
+        );
     }
 
     #[test]
