@@ -1,7 +1,7 @@
 //! Renders the Java side of the Java↔Rust contract. The shim is ~90%
 //! generated; humans edit `crates/contract`, never the emitted files.
 
-use ferridian_contract::{Contract, GamePassKind};
+use ferridian_contract::{CameraUniforms, Contract, GamePassKind};
 
 pub const JAVA_PACKAGE: &str = "io.ferridian.shim.contract";
 pub const GENERATED_DIR: &str = "io/ferridian/shim/contract";
@@ -21,6 +21,10 @@ pub fn render_java(contract: &Contract) -> Vec<(String, String)> {
         (
             format!("{GENERATED_DIR}/FerridianContract.java"),
             render_contract_class(contract),
+        ),
+        (
+            format!("{GENERATED_DIR}/CameraUniforms.java"),
+            render_camera_record(),
         ),
     ]
 }
@@ -80,6 +84,56 @@ fn render_contract_class(contract: &Contract) -> String {
     out
 }
 
+fn java_field_name(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    let mut upper_next = false;
+    for c in snake.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The Java mirror of `CameraUniforms`, rendered from the contract's
+/// std140 field table so the two encoders cannot drift.
+fn render_camera_record() -> String {
+    let fields: Vec<(String, usize)> = CameraUniforms::STD140_FIELDS
+        .iter()
+        .map(|(name, offset)| (java_field_name(name), *offset))
+        .collect();
+    let mut out = String::from(HEADER);
+    out.push_str(&format!("package {JAVA_PACKAGE};\n\n"));
+    out.push_str("import java.nio.ByteBuffer;\nimport java.nio.ByteOrder;\n\n");
+    out.push_str(
+        "/** Per-frame camera and sun state published to the engine (std140 layout). */\n",
+    );
+    out.push_str("public record CameraUniforms(\n");
+    let components: Vec<String> = fields
+        .iter()
+        .map(|(name, _)| format!("        float {name}"))
+        .collect();
+    out.push_str(&components.join(",\n"));
+    out.push_str(") {\n");
+    out.push_str(&format!(
+        "    public static final int STD140_SIZE = {};\n\n",
+        CameraUniforms::STD140_SIZE
+    ));
+    out.push_str(
+        "    /** Encode at the contract's std140 offsets (little-endian). */\n    public void writeStd140(ByteBuffer buffer) {\n        buffer.order(ByteOrder.LITTLE_ENDIAN);\n",
+    );
+    for (name, offset) in &fields {
+        out.push_str(&format!("        buffer.putFloat({offset}, {name});\n"));
+    }
+    out.push_str("    }\n}\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,7 +141,7 @@ mod tests {
     #[test]
     fn generated_java_is_stable() {
         let files = render_java(&Contract::current());
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         for (path, content) in &files {
             insta::assert_snapshot!(path.replace('/', "_"), content);
         }
