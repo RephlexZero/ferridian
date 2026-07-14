@@ -8,6 +8,18 @@
 //! GPU tests are gated on `FERRIDIAN_GPU_TESTS=1` (set by `mise run gpu-test`
 //! and the container CI job) so laptop/CI legs without a Vulkan ICD stay green.
 
+mod golden;
+mod image;
+mod render;
+
+pub use golden::{
+    assert_matches_golden, assert_matches_golden_with, bless_enabled, failures_dir, goldens_dir,
+};
+pub use image::{
+    DiffPolicy, ImageDiff, ImageError, RgbaImage, diff_heatmap, diff_images, diff_passes,
+};
+pub use render::{RenderSpec, ShaderSpec, render_offscreen};
+
 use ferridian_vk_rt::{RuntimeOptions, VkRuntime};
 
 /// True when GPU-gated tests should actually run.

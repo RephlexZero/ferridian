@@ -53,6 +53,11 @@ description = "Run GPU-gated testkit tests (needs a Vulkan ICD; lavapipe in the 
 run = "cargo nextest run -p ferridian-testkit"
 env = { FERRIDIAN_GPU_TESTS = "1" }
 
+[tasks.golden-bless]
+description = "Re-bless golden baselines — ONLY from inside the pinned Mesa container"
+run = "cargo nextest run -p ferridian-testkit"
+env = { FERRIDIAN_GPU_TESTS = "1", FERRIDIAN_BLESS = "1" }
+
 [tasks.shim-build]
 description = "Build the Fabric shim (needs network for Loom/Minecraft resolution; not part of ci yet)"
 run = "gradle -p shim build"

@@ -153,7 +153,19 @@ impl VkRuntime {
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
-        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_infos);
+        // slangc-compiled shaders routinely declare the DrawParameters
+        // capability (SV_VertexID and friends), which is only legal with the
+        // 1.1-core shaderDrawParameters feature enabled — so enable it
+        // wherever the device offers it.
+        let mut supported_11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut supported = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_11);
+        // SAFETY: physical_device comes from this instance; the structs are live.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut supported) };
+        let mut enabled_11 = vk::PhysicalDeviceVulkan11Features::default()
+            .shader_draw_parameters(supported_11.shader_draw_parameters == vk::TRUE);
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_infos)
+            .push_next(&mut enabled_11);
         // SAFETY: physical_device comes from this instance; create info outlives the call.
         let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
         // SAFETY: the queue family/index were validated during device creation.

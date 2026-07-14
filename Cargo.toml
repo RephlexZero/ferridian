@@ -43,6 +43,7 @@ ferridian-pack-format = { path = "crates/pack-format" }
 ferridian-vk-rt = { path = "crates/vk-rt" }
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
 insta = { version = "1.42", features = ["toml"] }
+png = "0.17"
 rspirv = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

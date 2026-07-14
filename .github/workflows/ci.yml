@@ -53,14 +53,25 @@ jobs:
     # workflow has pushed one; building inline keeps this green until then.
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Golden baselines live in git-lfs; the harness refuses to compare
+          # against un-smudged pointer files.
+          lfs: true
       - name: Build pinned Mesa image
         run: docker build -f ci/mesa.Dockerfile -t ferridian-mesa:ci .
-      - name: GPU tests on lavapipe (validation errors fail)
+      - name: GPU + golden tests on lavapipe (validation errors fail)
         run: |
           docker run --rm -v "$PWD:/work" -w /work \
             -e FERRIDIAN_GPU_TESTS=1 \
             ferridian-mesa:ci \
             bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit'
+      - name: Upload failing renders + heatmaps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-failures
+          path: target/golden-failures/
+          if-no-files-found: ignore
       - name: Build reference pack with pinned slangc
         run: |
           docker run --rm -v "$PWD:/work" -w /work \
