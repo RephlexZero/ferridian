@@ -45,22 +45,26 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M0 walking skeleton
+## Status: M1 safety net complete, M2 started
 
-Done: workspace + tooling + CI wiring; pass-through Vulkan layer
-(negotiation + create-call chaining); testkit proving VVL errors fail tests
-on lavapipe; packc building the reference pack end-to-end (verified against
-slangc 2026.13); contract→Java codegen; upstream-watch polling + inventory
-diffing; mesa image + devcontainer.
+M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
+blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
+jar→classfile-signature extraction live-tested against real 26.2/26.3 jars
+(it caught Mojang's `blaze3d`→`renderpearl` move in the 26.3 snapshots),
+four fuzz targets (which evicted panicky rspirv from the untrusted path),
+and a nightly Miri/ASan/sync-validation workflow. M2 has its first real
+interception: the layer loads under the real Vulkan loader beneath VVL and
+counts `vkCmdBeginRenderPass`, proven by a GPU-gated end-to-end test.
 
-Follow-ups tracked toward M1+:
+Follow-ups tracked toward M2+:
 
-- [ ] Real interception/dispatch in `vk-layer` (M2) and pass detection
-- [ ] Golden-image render harness + first LFS baselines (M1)
-- [ ] upstream-watch: CI-side decompile → signature inventory extraction (M1)
+- [ ] vk-layer: per-object dispatch tables, then injection into a real game process (M2)
+- [ ] Engine composite over the intercepted frame; pass detection via the contract (M2)
+- [ ] packc `serve` hot reload (M3)
 - [ ] Verify shim Gradle/Loom versions against live Maven; wire `shim-build` into CI
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
-- [ ] Nightly workflow: slow VVL modes, ASan/LSan on vk-layer, Miri on pure crates
+- [ ] Renovate/Dependabot for Fabric Loader/API + Vulkan-Headers/VVL bumps
+- [ ] GPU-assisted validation in nightly once verified against lavapipe
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
 - [ ] Photon port permission outreach (human task, before any port work)

@@ -122,20 +122,20 @@ Exactly **one** image (`ci/mesa.Dockerfile`): pinned Mesa/lavapipe, pushed to GH
 **Per-PR (fast-fail order):**
 1. ✅ Lint: `fmt`, `clippy -D warnings` (workspace.lints), typos, taplo.
 2. ✅ Build+test matrix: `ubuntu-latest`, `windows-latest`, `macos-14` (Apple silicon) — nextest. *(workflow in place; first hosted run pending push of the restructure)*
-3. ⏳ Golden render job (pinned Mesa container): scene fixtures on lavapipe, **VVL enabled, any validation error = test failure** ✅ *(testkit gate proven on lavapipe)*, perceptual diff (dssim-style tolerance) vs LFS baselines *(harness + baselines = M1)*.
+3. ✅ Golden render job (pinned Mesa container): fixtures on lavapipe, **VVL enabled, any validation error = test failure**, perceptual diff vs LFS baselines. *(2026-07-14: testkit harness — offscreen render, PNG readback, DiffPolicy of one quantum/zero differing pixels, failure heatmaps as CI artifacts; first baseline blessed in-container; `mise run golden-bless` is the re-bless flow. Already caught a real bug: slangc output requires `shaderDrawParameters`.)*
 4. macOS leg: MoltenVK if runnable on GH macOS VMs; otherwise SwiftShader + static portability-subset capability lint against committed MoltenVK profile. *(Verify MoltenVK-on-runner early — open question.)*
 5. ⏳ Gates: cargo-semver-checks (public crates), cargo-deny ✅, cargo-vet.
 
-**Nightly:** sync validation + GPU-assisted validation (slow VVL modes); ASan/LSan on `vk-layer` (Linux); Miri on pure crates (`pack-format`, engine internals). *(deferred to M1 — needs the render harness to be meaningful)*
+**Nightly:** ✅ `nightly.yml` (2026-07-14): VVL sync validation on lavapipe; ASan/LSan on `vk-layer`/`vk-rt`/`engine`; Miri on `pack-format`/`engine`/`contract`. All three legs verified in-container before wiring. GPU-assisted validation still pending a lavapipe-support check.
 
-**Weekly:** ⏳ cargo-fuzz targets — pack manifest parser ✅ (`fuzz.yml`, time-boxed), SPIR-V reflection input, contract decoder. (Parsers of untrusted packs are the attack surface.)
+**Weekly:** ✅ cargo-fuzz matrix (`fuzz.yml`): pack manifest parser, SPIR-V reflection, contract decoder, classfile parser. *(2026-07-14: fuzzing immediately paid for itself — rspirv 0.12 panics on malformed SPIR-V, so reflection now walks the word stream itself and rspirv is off the untrusted path; crash inputs are committed regression fixtures.)*
 
 **Upstream watch (6 h cron):**
 1. ✅ Poll Mojang `version_manifest_v2.json`. *(live-tested against the real manifest; `upstream-watch.yml` opens/comments issues on exit 3)*
-2. ⏳ New snapshot → download jar (unobfuscated), decompile with Vineflower **in CI only**. *(M1)*
-3. ⏳ Extract derived **signature inventory** of tracked render classes/methods; diff vs committed inventory. *(diff/report types + CLI in place; extraction = M1)*
-4. ⏳ No diff → green tick on tracking issue. Diff → bot opens issue with signature-level report ✅; Claude Code Action drafts shim-regen PR, gated on goldens passing under the new jar.
-5. ✅ **Legal guardrail:** commit only derived inventories (signatures/hashes) — never decompiled Mojang source in a public repo. *(stated in the workflow, upstream-watch docs, and architecture docs)*
+2. ✅ New version → `fetch-jar` (sha1-verified) in CI only. **Vineflower turned out unnecessary**: signatures parse straight out of the classfiles (own minimal bounds-checked parser, no JVM/decompiler in the loop) — structurally stronger legal guardrail, and fuzzable.
+3. ✅ Extract derived **signature inventory** of tracked render classes/methods; diff vs committed inventory. *(2026-07-14: 26.2 baseline committed — 18 classes across `blaze3d.vulkan`, `blaze3d.systems`, `client.renderer`. Live diff against 26.3-snapshot-3 correctly caught Mojang moving the GPU stack to `com.mojang.renderpearl` — the exact churn class this exists for.)*
+4. ⏳ Diff report lands on the tracking issue ✅ (fetch→extract→diff wired into the workflow); Claude Code Action drafting a shim-regen PR gated on goldens = still to come.
+5. ✅ **Legal guardrail:** commit only derived inventories (signatures/hashes) — never decompiled Mojang source in a public repo. *(now enforced by construction: nothing in the pipeline can emit source)*
 6. ⏳ Renovate watches Fabric Loader/API; Dependabot watches Vulkan-Headers/VVL releases. *(bots not yet enabled)*
 
 ---
@@ -172,8 +172,8 @@ Prove the engine on a real-world pack; give users a familiar look at launch; exe
 | # | Milestone | Target | Exit criteria | Status |
 |---|---|---|---|---|
 | M0 | Walking skeleton | +2 wk | Repo scaffold; `mise run ci` green on 3 OSes; testkit boots lavapipe and fails a test on a VVL error; mesa image + devcontainer live | ✅ **2026-07-13** — scaffold per §4.1; VVL-failure gate proven on lavapipe in the container; ci green locally (3-OS matrix defined, first hosted run pending push) |
-| M1 | Safety net complete | +6 wk | Golden harness + baselines; upstream-watch opening issues on real snapshots; fuzz targets running | ⏳ partial: manifest fuzz target + upstream-watch poll/issue workflow exist; golden harness + decompile/inventory extraction outstanding |
-| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer | pass-through layer shell + loader negotiation done; interception/dispatch not started |
+| M1 | Safety net complete | +6 wk | Golden harness + baselines; upstream-watch opening issues on real snapshots; fuzz targets running | ✅ **2026-07-14** — golden harness + first blessed baseline (in-container); fetch→extract→diff live-tested against real 26.2/26.3 jars and wired into the issue workflow; four fuzz targets (one real rspirv panic found + fixed). Hosted runs of the workflows pending push |
+| M2 | Layer + triangle | +10 wk | vk-layer intercepts 26.x snapshot; engine composites over game frame; pass detection on current renderer | ⏳ started 2026-07-14: layer loads under the **real Vulkan loader** on lavapipe beneath VVL (manifest + VK_LAYER_PATH), and intercepts `vkCmdBeginRenderPass` (counted, forwarded, validation-clean, proven by GPU-gated test). Next: per-object dispatch tables, game-process injection, composite-over-frame |
 | M3 | Pack pipeline v0 | +16 wk | `packc` builds Slang pack → SPIR-V artifact ✅; hot reload; reference pack renders (shadows + deferred + one volumetric) | `packc build/validate` work end-to-end on `packs/reference`; `serve` (hot reload) stubbed |
 | M4 | Photon port alpha | +24 wk | Permission secured; Photon-on-engine parity screenshots vs Iris/OpenGL reference goldens | not started — **permission email to sixthsurge is the next human action** |
 | M5 | Public alpha | Aligned to Mojang's OpenGL-removal messaging (~late 2026/early 2027) | Reference pack showcase + Photon port + docs + verifiable release artifacts | — |
