@@ -15,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -36,7 +36,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -52,7 +52,7 @@ jobs:
     # TODO(container.yml): switch to the immutable GHCR tag once the image
     # workflow has pushed one; building inline keeps this green until then.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Golden baselines live in git-lfs; the harness refuses to compare
           # against un-smudged pointer files.
@@ -67,7 +67,7 @@ jobs:
             bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit -p ferridian-vk-layer'
       - name: Upload failing renders + heatmaps
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: golden-failures
           path: target/golden-failures/
@@ -82,14 +82,14 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           # Minecraft 26.x requires Java 25 (see shim/gradle.properties for
           # the verified version set).
           java-version: "25"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "9.6.1"
       - name: Build the Fabric shim against live Maven
@@ -105,7 +105,7 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
       # Follow-ups (README): cargo-semver-checks once crates are published,
       # cargo-vet once the audit set is seeded.
