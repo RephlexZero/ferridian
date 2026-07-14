@@ -45,7 +45,7 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M2 in-container scope complete; M3 hot reload landed
+## Status: M2 in-container scope complete; M3 hot reload closed end-to-end
 
 M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
 blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
@@ -59,16 +59,21 @@ Vulkan loader beneath VVL with per-object dispatch tables (proven with two
 concurrent instance+device stacks), intercepts debug-utils labels and
 classifies render passes against the contract's anchors, and **composites
 its own draw inside the game's render pass** — pixel-verified, and only
-into classified passes; Unknown is forwarded untouched. M3's hot reload v0:
-`packc serve` watches, rebuilds, and atomically publishes artifact
-generations. The Fabric shim builds against live Maven (MC 26.2, loader
-0.19.3, Loom 1.17.14, JDK 25) and CI rejects contract/codegen drift.
+into classified passes; Unknown is forwarded untouched. M3's hot reload is
+closed end to end: `packc serve` watches, rebuilds, and atomically publishes
+artifact generations; `engine::pack::PackWatcher` consumes them (exactly-once
+per generation, torn-read guarded, artifacts treated as untrusted input),
+proven by a testkit round-trip that puts every reloaded module on a real
+device under validation. The reference pack is now the four-pass M3 shape —
+screen-space shadows → deferred lighting → volumetric fog → composite. The
+Fabric shim builds against live Maven (MC 26.2, loader 0.19.3, Loom 1.17.14,
+JDK 25) and CI rejects contract/codegen drift.
 
 Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Engine-side consumption of `packc serve` generations (M3)
-- [ ] Reference pack buildout: shadows + deferred + one volumetric (M3)
+- [ ] Execute reloaded packs: descriptor wiring (binding name ↔ resource name) + pass scheduling on device (M4)
+- [ ] Reference pack: swap the placeholder camera model for real contract uniforms; golden-image the four passes
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
 - [ ] GPU-assisted validation in nightly — verified 2026-07-14 and **blocked**:

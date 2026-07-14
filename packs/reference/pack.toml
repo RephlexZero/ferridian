@@ -9,9 +9,33 @@ authors = ["Ferridian contributors"]
 [requirements]
 tier = "baseline"
 
+# Shader binding names match resource names — that correspondence is how the
+# engine will wire descriptors when passes execute for real.
+
+[[pass]]
+name = "shadows"
+kind = "graphics"
+shader = "shaders/shadows.slang"
+inputs = ["game_depth"]
+outputs = ["shadow_mask"]
+
+[[pass]]
+name = "deferred"
+kind = "graphics"
+shader = "shaders/deferred.slang"
+inputs = ["game_color", "game_depth", "shadow_mask"]
+outputs = ["lit"]
+
+[[pass]]
+name = "volumetric"
+kind = "graphics"
+shader = "shaders/volumetric.slang"
+inputs = ["game_depth", "shadow_mask"]
+outputs = ["fog"]
+
 [[pass]]
 name = "composite"
 kind = "graphics"
 shader = "shaders/composite.slang"
-inputs = ["game_color"]
+inputs = ["lit", "fog"]
 outputs = ["swapchain"]

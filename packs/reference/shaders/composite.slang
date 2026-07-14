@@ -1,32 +1,19 @@
-// Fullscreen composite: samples the captured game color and applies a
-// placeholder tonemap. The simplest possible pass that exercises the whole
-// packc pipeline (Slang -> SPIR-V -> reflection -> artifact).
+// Final combine: the lit scene attenuated by fog transmittance, plus the
+// fog's inscattered light, through a placeholder Reinhard tonemap. Real
+// grading (exposure, purkinje, LUTs) arrives with the showcase.
 
-struct VsOut
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-[shader("vertex")]
-VsOut vs_main(uint vertexId: SV_VertexID)
-{
-    // Fullscreen triangle from the vertex id; no vertex buffer needed.
-    VsOut output;
-    float2 uv = float2((vertexId << 1) & 2, vertexId & 2);
-    output.position = float4(uv * 2.0 - 1.0, 0.0, 1.0);
-    output.uv = uv;
-    return output;
-}
+#include "common.slang"
 
 [[vk::binding(0, 0)]]
-Sampler2D game_color;
+Sampler2D lit;
+[[vk::binding(1, 0)]]
+Sampler2D fog;
 
 [shader("fragment")]
 float4 fs_main(VsOut input) : SV_Target
 {
-    float3 color = game_color.Sample(input.uv).rgb;
-    // Placeholder Reinhard tonemap; real grading arrives with the showcase.
+    float4 scatter = fog.Sample(input.uv);
+    float3 color = lit.Sample(input.uv).rgb * scatter.a + scatter.rgb;
     color = color / (color + 1.0);
     return float4(color, 1.0);
 }
