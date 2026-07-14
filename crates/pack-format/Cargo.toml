@@ -1,6 +1,6 @@
 [package]
 name = "ferridian-pack-format"
-description = "Pack manifest schema types: serde only, zero I/O, Miri-able"
+description = "Pack manifest schema + SPIR-V reflection: pure types, zero I/O, Miri-able"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+rspirv = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }

@@ -1,9 +1,16 @@
-//! Pack manifest schema.
+//! Pack manifest schema and artifact reflection types.
 //!
 //! Types only: parsing from strings, structural validation, serde. No file
 //! I/O lives here — that keeps the whole crate runnable under Miri and makes
 //! the manifest parser a clean fuzz target (`fuzz/fuzz_targets/pack_manifest.rs`),
-//! since pack manifests are untrusted input.
+//! since pack manifests are untrusted input. SPIR-V reflection lives here for
+//! the same reason: it is part of the artifact format, both the compiler
+//! (producing `reflection.toml`) and the engine (re-reflecting loaded modules
+//! to wire descriptors) parse it, and its input is equally untrusted.
+
+pub mod reflection;
+
+pub use reflection::{BindingReflection, EntryPointReflection, ShaderReflection, reflect_spirv};
 
 use serde::{Deserialize, Serialize};
 

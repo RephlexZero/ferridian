@@ -2,11 +2,14 @@
 //! time. Errors surface at author time; the engine only ever loads a
 //! compiled artifact.
 
-mod reflection;
 mod serve;
 mod slang;
 
-pub use reflection::{BindingReflection, EntryPointReflection, ShaderReflection, reflect_spirv};
+// Reflection moved to `pack-format` (the engine re-reflects artifacts at load
+// time); re-exported here so compiler-side callers keep one import path.
+pub use ferridian_pack_format::{
+    BindingReflection, EntryPointReflection, ShaderReflection, reflect_spirv,
+};
 pub use serve::{SourceSnapshot, read_generation, write_generation};
 pub use slang::{SlangCompiler, resolve_slangc};
 
