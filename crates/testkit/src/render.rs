@@ -30,6 +30,10 @@ pub struct RenderSpec<'a> {
     pub clear_color: [f32; 4],
     pub vertex_count: u32,
     pub shader: ShaderSpec<'a>,
+    /// Wrap the render pass in a `vkCmd{Begin,End}DebugUtilsLabelEXT` pair —
+    /// how layer tests stand in for Blaze3D's debug groups. Requires a
+    /// runtime with validation enabled (that's what enables debug utils).
+    pub pass_label: Option<&'a str>,
 }
 
 const READBACK_TIMEOUT_NS: u64 = 10_000_000_000;
@@ -257,6 +261,17 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
                 extent,
             })
             .clear_values(&clear_values);
+        let debug_utils = spec.pass_label.map(|label| {
+            let name = CString::new(label).expect("pass label has no interior NUL");
+            (
+                ash::ext::debug_utils::Device::new(runtime.instance(), device),
+                name,
+            )
+        });
+        if let Some((debug_utils, name)) = &debug_utils {
+            let label = vk::DebugUtilsLabelEXT::default().label_name(name);
+            debug_utils.cmd_begin_debug_utils_label(command_buffer, &label);
+        }
         device.cmd_begin_render_pass(
             command_buffer,
             &render_pass_begin,
@@ -265,6 +280,9 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
         device.cmd_draw(command_buffer, spec.vertex_count, 1, 0, 0);
         device.cmd_end_render_pass(command_buffer);
+        if let Some((debug_utils, _)) = &debug_utils {
+            debug_utils.cmd_end_debug_utils_label(command_buffer);
+        }
 
         let copy = vk::BufferImageCopy::default()
             .image_subresource(

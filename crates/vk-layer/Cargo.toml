@@ -16,9 +16,13 @@ workspace = true
 
 [dependencies]
 ash = { workspace = true }
+ferridian-contract = { workspace = true }
+ferridian-engine = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+ferridian-contract = { workspace = true }
+ferridian-engine = { workspace = true }
 ferridian-pack-compiler = { workspace = true }
 ferridian-testkit = { workspace = true }
 ferridian-vk-rt = { workspace = true }

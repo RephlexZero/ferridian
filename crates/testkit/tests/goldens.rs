@@ -36,6 +36,7 @@ fn gradient_matches_golden() {
                 vertex_entry: "vs_main",
                 fragment_entry: "fs_main",
             },
+            pass_label: None,
         },
     );
     // The render must be validation-clean *before* it can be golden.
@@ -63,6 +64,7 @@ fn clear_color_reaches_readback() {
                 vertex_entry: "vs_main",
                 fragment_entry: "fs_main",
             },
+            pass_label: None,
         },
     );
     gpu.assert_no_validation_errors();

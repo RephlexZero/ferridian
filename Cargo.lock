@@ -311,6 +311,8 @@ name = "ferridian-vk-layer"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ferridian-contract",
+ "ferridian-engine",
  "ferridian-pack-compiler",
  "ferridian-testkit",
  "ferridian-vk-rt",

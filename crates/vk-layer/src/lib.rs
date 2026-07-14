@@ -5,41 +5,31 @@
 //! advancement) and nothing else; all engine logic lives behind the [`hooks`]
 //! seam so tests and Miri reach maximal code in `ferridian-engine`.
 //!
-//! Current state: a correct pass-through layer. It chains `vkCreateInstance`
-//! and `vkCreateDevice` down the layer stack and forwards every other call
-//! unmodified. Actual frame interception is M2.
+//! Current state (M2 in progress): per-object dispatch tables keyed by
+//! dispatch key ([`dispatch`]), interception of `vkCmdBeginRenderPass` and
+//! the debug-utils label commands (Blaze3D's debug groups — the anchor
+//! stream contract-driven pass detection classifies), with everything else
+//! forwarded unmodified.
 
+mod dispatch;
 mod hooks;
 mod loader_interface;
 
 pub use loader_interface::LAYER_NAME;
 
 use std::ffi::{CStr, c_char};
-use std::sync::Mutex;
 
 use ash::vk;
+use ash::vk::Handle;
 
+use dispatch::{
+    DeviceState, InstanceState, PfnCmdBeginDebugUtilsLabel, PfnCmdBeginRenderPass,
+    PfnCmdEndDebugUtilsLabel, PfnDestroyDevice, PfnDestroyInstance, dispatch_key,
+};
 use loader_interface::{
     LayerFunction, NEGOTIATE_INTERFACE_STRUCT, PfnCreateDevice, PfnCreateInstance,
     VkLayerDeviceCreateInfo, VkLayerInstanceCreateInfo, VkNegotiateLayerInterface,
 };
-
-/// The next-layer proc-addr entry points, captured during create calls.
-/// A game process creates one instance/device, so single slots suffice for
-/// the skeleton; per-object dispatch tables arrive with real interception.
-static NEXT_GIPA: Mutex<Option<vk::PFN_vkGetInstanceProcAddr>> = Mutex::new(None);
-static NEXT_GDPA: Mutex<Option<vk::PFN_vkGetDeviceProcAddr>> = Mutex::new(None);
-static INSTANCE: Mutex<vk::Instance> = Mutex::new(vk::Instance::null());
-
-type PfnCmdBeginRenderPass = for<'a> unsafe extern "system" fn(
-    vk::CommandBuffer,
-    *const vk::RenderPassBeginInfo<'a>,
-    vk::SubpassContents,
-);
-
-/// Down-chain `vkCmdBeginRenderPass`, captured the first time the loader (or
-/// an upper layer) queries it through our GDPA.
-static NEXT_CMD_BEGIN_RENDER_PASS: Mutex<Option<PfnCmdBeginRenderPass>> = Mutex::new(None);
 
 /// Render passes begun through the layer, readable across the cdylib
 /// boundary (tests dlopen the layer and assert interception actually
@@ -47,6 +37,22 @@ static NEXT_CMD_BEGIN_RENDER_PASS: Mutex<Option<PfnCmdBeginRenderPass>> = Mutex:
 #[unsafe(no_mangle)]
 pub extern "system" fn ferridian_layer_render_pass_count() -> u64 {
     hooks::render_pass_count()
+}
+
+/// Render passes classified as the given [`ferridian_contract::GamePassKind`]
+/// (indexed per `GamePassKind::ALL` wire order). Out-of-range kinds return 0.
+#[unsafe(no_mangle)]
+pub extern "system" fn ferridian_layer_classified_pass_count(kind: u32) -> u64 {
+    hooks::classified_pass_count(kind)
+}
+
+/// Erase a typed function pointer into the loader's `PFN_vkVoidFunction`.
+macro_rules! as_void_pfn {
+    ($typed:ty, $function:expr) => {
+        // SAFETY: transmuting a fn pointer to the erased PFN_vkVoidFunction;
+        // the receiver transmutes it back to exactly $typed per the spec.
+        Some(unsafe { std::mem::transmute::<$typed, unsafe extern "system" fn()>($function) })
+    };
 }
 
 /// Entry point named in the layer JSON manifest; the loader calls this first.
@@ -88,42 +94,26 @@ pub unsafe extern "system" fn ferridian_get_instance_proc_addr(
     // SAFETY: caller guarantees a NUL-terminated string per the Vulkan spec.
     let name = unsafe { CStr::from_ptr(p_name) };
     match name.to_bytes() {
-        b"vkGetInstanceProcAddr" => {
-            // SAFETY: transmuting a fn pointer to the erased PFN_vkVoidFunction.
-            Some(unsafe {
-                std::mem::transmute::<vk::PFN_vkGetInstanceProcAddr, unsafe extern "system" fn()>(
-                    ferridian_get_instance_proc_addr,
-                )
-            })
-        }
+        b"vkGetInstanceProcAddr" => as_void_pfn!(
+            vk::PFN_vkGetInstanceProcAddr,
+            ferridian_get_instance_proc_addr
+        ),
         b"vkGetDeviceProcAddr" => {
-            // SAFETY: as above.
-            Some(unsafe {
-                std::mem::transmute::<vk::PFN_vkGetDeviceProcAddr, unsafe extern "system" fn()>(
-                    ferridian_get_device_proc_addr,
-                )
-            })
+            as_void_pfn!(vk::PFN_vkGetDeviceProcAddr, ferridian_get_device_proc_addr)
         }
-        b"vkCreateInstance" => {
-            // SAFETY: as above.
-            Some(unsafe {
-                std::mem::transmute::<PfnCreateInstance, unsafe extern "system" fn()>(
-                    ferridian_create_instance,
-                )
-            })
-        }
-        b"vkCreateDevice" => {
-            // SAFETY: as above.
-            Some(unsafe {
-                std::mem::transmute::<PfnCreateDevice, unsafe extern "system" fn()>(
-                    ferridian_create_device,
-                )
-            })
-        }
+        b"vkCreateInstance" => as_void_pfn!(PfnCreateInstance, ferridian_create_instance),
+        b"vkDestroyInstance" => as_void_pfn!(PfnDestroyInstance, ferridian_destroy_instance),
+        b"vkCreateDevice" => as_void_pfn!(PfnCreateDevice, ferridian_create_device),
         _ => {
-            let next = *NEXT_GIPA.lock().expect("layer state lock poisoned");
+            if instance == vk::Instance::null() {
+                return None;
+            }
+            // SAFETY: a non-null instance handle passed to GIPA is live and
+            // dispatchable per the Vulkan spec.
+            let key = unsafe { dispatch_key(instance.as_raw()) };
+            let gipa = dispatch::with_instance(key, |state| state.gipa)?;
             // SAFETY: forwarding the unmodified query down the chain.
-            next.and_then(|gipa| unsafe { gipa(instance, p_name) })
+            unsafe { gipa(instance, p_name) }
         }
     }
 }
@@ -134,64 +124,93 @@ pub unsafe extern "system" fn ferridian_get_device_proc_addr(
     device: vk::Device,
     p_name: *const c_char,
 ) -> vk::PFN_vkVoidFunction {
-    if p_name.is_null() {
+    if p_name.is_null() || device == vk::Device::null() {
         return None;
     }
     // SAFETY: caller guarantees a NUL-terminated string per the Vulkan spec.
     let name = unsafe { CStr::from_ptr(p_name) };
     match name.to_bytes() {
         b"vkGetDeviceProcAddr" => {
-            // SAFETY: transmuting a fn pointer to the erased PFN_vkVoidFunction.
-            Some(unsafe {
-                std::mem::transmute::<vk::PFN_vkGetDeviceProcAddr, unsafe extern "system" fn()>(
-                    ferridian_get_device_proc_addr,
-                )
-            })
+            as_void_pfn!(vk::PFN_vkGetDeviceProcAddr, ferridian_get_device_proc_addr)
         }
+        b"vkDestroyDevice" => as_void_pfn!(PfnDestroyDevice, ferridian_destroy_device),
         b"vkCmdBeginRenderPass" => {
-            let next = *NEXT_GDPA.lock().expect("layer state lock poisoned");
-            // SAFETY: querying the down-chain pointer we will forward to.
-            let next_begin = next.and_then(|gdpa| unsafe { gdpa(device, p_name) })?;
-            // SAFETY: the down-chain vkCmdBeginRenderPass has exactly this type.
-            let next_begin = unsafe {
-                std::mem::transmute::<unsafe extern "system" fn(), PfnCmdBeginRenderPass>(
-                    next_begin,
-                )
-            };
-            *NEXT_CMD_BEGIN_RENDER_PASS
-                .lock()
-                .expect("layer state lock poisoned") = Some(next_begin);
-            // SAFETY: transmuting our hook to the erased PFN_vkVoidFunction.
-            Some(unsafe {
-                std::mem::transmute::<PfnCmdBeginRenderPass, unsafe extern "system" fn()>(
-                    ferridian_cmd_begin_render_pass,
-                )
-            })
+            as_void_pfn!(PfnCmdBeginRenderPass, ferridian_cmd_begin_render_pass)
         }
+        b"vkCmdBeginDebugUtilsLabelEXT" => as_void_pfn!(
+            PfnCmdBeginDebugUtilsLabel,
+            ferridian_cmd_begin_debug_utils_label
+        ),
+        b"vkCmdEndDebugUtilsLabelEXT" => as_void_pfn!(
+            PfnCmdEndDebugUtilsLabel,
+            ferridian_cmd_end_debug_utils_label
+        ),
         _ => {
-            let next = *NEXT_GDPA.lock().expect("layer state lock poisoned");
+            // SAFETY: a non-null device handle passed to GDPA is live and
+            // dispatchable per the Vulkan spec.
+            let key = unsafe { dispatch_key(device.as_raw()) };
+            let gdpa = dispatch::with_device(key, |state| state.gdpa)?;
             // SAFETY: forwarding the unmodified query down the chain.
-            next.and_then(|gdpa| unsafe { gdpa(device, p_name) })
+            unsafe { gdpa(device, p_name) }
         }
     }
 }
 
 /// # Safety
 /// Standard `vkCmdBeginRenderPass` contract; called by the dispatch chain
-/// only after our GDPA handed this pointer out (which also captured the
-/// down-chain pointer it forwards to).
+/// only after our GDPA handed this pointer out.
 unsafe extern "system" fn ferridian_cmd_begin_render_pass(
     command_buffer: vk::CommandBuffer,
     p_render_pass_begin: *const vk::RenderPassBeginInfo<'_>,
     contents: vk::SubpassContents,
 ) {
     hooks::render_pass_begun();
-    let next = *NEXT_CMD_BEGIN_RENDER_PASS
-        .lock()
-        .expect("layer state lock poisoned");
+    // SAFETY: command buffers are dispatchable handles carrying their
+    // device's dispatch key.
+    let key = unsafe { dispatch_key(command_buffer.as_raw()) };
+    let next = dispatch::with_device(key, |state| state.cmd_begin_render_pass).flatten();
     if let Some(next) = next {
         // SAFETY: forwarding the caller's (still valid) arguments down the chain.
         unsafe { next(command_buffer, p_render_pass_begin, contents) };
+    }
+}
+
+/// # Safety
+/// Standard `vkCmdBeginDebugUtilsLabelEXT` contract; `p_label` points to a
+/// live label struct with a NUL-terminated name.
+unsafe extern "system" fn ferridian_cmd_begin_debug_utils_label(
+    command_buffer: vk::CommandBuffer,
+    p_label: *const vk::DebugUtilsLabelEXT<'_>,
+) {
+    // SAFETY: label struct and its name pointer are valid per the contract.
+    let name = unsafe {
+        (!p_label.is_null())
+            .then(|| (*p_label).p_label_name)
+            .filter(|name| !name.is_null())
+            .map(|name| CStr::from_ptr(name))
+    };
+    if let Some(name) = name {
+        hooks::label_begun(&name.to_string_lossy());
+    }
+    // SAFETY: dispatchable handle; see ferridian_cmd_begin_render_pass.
+    let key = unsafe { dispatch_key(command_buffer.as_raw()) };
+    let next = dispatch::with_device(key, |state| state.cmd_begin_debug_utils_label).flatten();
+    if let Some(next) = next {
+        // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+        unsafe { next(command_buffer, p_label) };
+    }
+}
+
+/// # Safety
+/// Standard `vkCmdEndDebugUtilsLabelEXT` contract.
+unsafe extern "system" fn ferridian_cmd_end_debug_utils_label(command_buffer: vk::CommandBuffer) {
+    hooks::label_ended();
+    // SAFETY: dispatchable handle; see ferridian_cmd_begin_render_pass.
+    let key = unsafe { dispatch_key(command_buffer.as_raw()) };
+    let next = dispatch::with_device(key, |state| state.cmd_end_debug_utils_label).flatten();
+    if let Some(next) = next {
+        // SAFETY: forwarding the caller's (still valid) argument down the chain.
+        unsafe { next(command_buffer) };
     }
 }
 
@@ -241,13 +260,51 @@ unsafe extern "system" fn ferridian_create_instance(
         unsafe { std::mem::transmute::<unsafe extern "system" fn(), PfnCreateInstance>(create) };
     // SAFETY: forwarding the caller's (still valid) arguments down the chain.
     let result = unsafe { create(p_create_info, p_allocator, p_instance) };
-    if result == vk::Result::SUCCESS {
-        *NEXT_GIPA.lock().expect("layer state lock poisoned") = Some(next_gipa);
-        // SAFETY: on success the loader guarantees *p_instance is initialized.
-        *INSTANCE.lock().expect("layer state lock poisoned") = unsafe { *p_instance };
-        hooks::instance_created();
+    if result != vk::Result::SUCCESS {
+        return result;
     }
+    // SAFETY: on success the loader guarantees *p_instance is a live
+    // dispatchable handle.
+    let (instance, key) = unsafe { (*p_instance, dispatch_key((*p_instance).as_raw())) };
+    // SAFETY: querying the down-chain vkDestroyInstance for the new instance.
+    let destroy = unsafe { next_gipa(instance, c"vkDestroyInstance".as_ptr()) };
+    let Some(destroy) = destroy else {
+        // Core function missing below us: the chain is unusable.
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    dispatch::insert_instance(
+        key,
+        InstanceState {
+            instance,
+            gipa: next_gipa,
+            // SAFETY: the down-chain vkDestroyInstance has exactly this type.
+            destroy_instance: unsafe {
+                std::mem::transmute::<unsafe extern "system" fn(), PfnDestroyInstance>(destroy)
+            },
+        },
+    );
+    hooks::instance_created();
     result
+}
+
+/// # Safety
+/// Standard `vkDestroyInstance` contract.
+unsafe extern "system" fn ferridian_destroy_instance(
+    instance: vk::Instance,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    if instance == vk::Instance::null() {
+        return;
+    }
+    // SAFETY: a non-null instance passed to vkDestroyInstance is still live.
+    let key = unsafe { dispatch_key(instance.as_raw()) };
+    let Some(state) = dispatch::remove_instance(key) else {
+        // Not ours (or already gone) — nothing to forward to.
+        return;
+    };
+    hooks::instance_destroyed();
+    // SAFETY: forwarding the destroy down the chain exactly once.
+    unsafe { (state.destroy_instance)(instance, p_allocator) };
 }
 
 /// # Safety
@@ -287,7 +344,13 @@ unsafe extern "system" fn ferridian_create_device(
     let (Some(next_gipa), Some(next_gdpa)) = (next_gipa, next_gdpa) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    let instance = *INSTANCE.lock().expect("layer state lock poisoned");
+    // Physical devices carry their instance's dispatch key — that lookup is
+    // how a device create finds the instance it belongs to.
+    // SAFETY: the physical device is a live dispatchable handle.
+    let instance_key = unsafe { dispatch_key(physical_device.as_raw()) };
+    let Some(instance) = dispatch::with_instance(instance_key, |state| state.instance) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
     // SAFETY: querying the down-chain vkCreateDevice from the loader.
     let create = unsafe { next_gipa(instance, c"vkCreateDevice".as_ptr()) };
     let Some(create) = create else {
@@ -298,9 +361,68 @@ unsafe extern "system" fn ferridian_create_device(
         unsafe { std::mem::transmute::<unsafe extern "system" fn(), PfnCreateDevice>(create) };
     // SAFETY: forwarding the caller's (still valid) arguments down the chain.
     let result = unsafe { create(physical_device, p_create_info, p_allocator, p_device) };
-    if result == vk::Result::SUCCESS {
-        *NEXT_GDPA.lock().expect("layer state lock poisoned") = Some(next_gdpa);
-        hooks::device_created();
+    if result != vk::Result::SUCCESS {
+        return result;
     }
+    // SAFETY: on success the loader guarantees *p_device is a live
+    // dispatchable handle.
+    let (device, key) = unsafe { (*p_device, dispatch_key((*p_device).as_raw())) };
+    // SAFETY: resolving down-chain commands for the new device.
+    let resolve = |name: &CStr| unsafe { next_gdpa(device, name.as_ptr()) };
+    let Some(destroy) = resolve(c"vkDestroyDevice") else {
+        // Core function missing below us: the chain is unusable.
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    /// Retype a resolved down-chain pointer. Each caller names the command it
+    /// resolved, whose Vulkan-spec type is exactly the target type; extension
+    /// commands may legitimately resolve to `None`.
+    macro_rules! retype {
+        ($pfn:expr, $typed:ty) => {
+            // SAFETY: per the macro's contract above.
+            $pfn.map(|pfn| unsafe {
+                std::mem::transmute::<unsafe extern "system" fn(), $typed>(pfn)
+            })
+        };
+    }
+    // SAFETY: the down-chain vkDestroyDevice has exactly this type.
+    let destroy_device =
+        unsafe { std::mem::transmute::<unsafe extern "system" fn(), PfnDestroyDevice>(destroy) };
+    dispatch::insert_device(
+        key,
+        DeviceState {
+            gdpa: next_gdpa,
+            destroy_device,
+            cmd_begin_render_pass: retype!(resolve(c"vkCmdBeginRenderPass"), PfnCmdBeginRenderPass),
+            cmd_begin_debug_utils_label: retype!(
+                resolve(c"vkCmdBeginDebugUtilsLabelEXT"),
+                PfnCmdBeginDebugUtilsLabel
+            ),
+            cmd_end_debug_utils_label: retype!(
+                resolve(c"vkCmdEndDebugUtilsLabelEXT"),
+                PfnCmdEndDebugUtilsLabel
+            ),
+        },
+    );
+    hooks::device_created();
     result
+}
+
+/// # Safety
+/// Standard `vkDestroyDevice` contract.
+unsafe extern "system" fn ferridian_destroy_device(
+    device: vk::Device,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    if device == vk::Device::null() {
+        return;
+    }
+    // SAFETY: a non-null device passed to vkDestroyDevice is still live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    let Some(state) = dispatch::remove_device(key) else {
+        // Not ours (or already gone) — nothing to forward to.
+        return;
+    };
+    hooks::device_destroyed();
+    // SAFETY: forwarding the destroy down the chain exactly once.
+    unsafe { (state.destroy_device)(device, p_allocator) };
 }
