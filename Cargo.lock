@@ -330,6 +330,7 @@ name = "ferridian-vk-rt"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ferridian-contract",
  "ferridian-engine",
  "gpu-allocator",
  "thiserror 2.0.18",

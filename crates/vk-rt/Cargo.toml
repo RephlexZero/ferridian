@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 ash = { workspace = true }
+# The camera uniform block's layout is contract-defined.
+ferridian-contract = { workspace = true }
 # Pure crate (no Vulkan): the executor consumes the engine's ExecutionPlan.
 ferridian-engine = { workspace = true }
 gpu-allocator = { workspace = true }

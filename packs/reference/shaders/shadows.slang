@@ -21,9 +21,9 @@ float4 fs_main(VsOut input) : SV_Target
 
     // Screen-space direction toward the sun; the epsilon keeps a sun straight
     // overhead from degenerating into a zero-length march.
-    float2 stepUv = normalize(float2(SUN_DIRECTION.x, -SUN_DIRECTION.z) + 1e-4)
+    float2 stepUv = normalize(float2(camera.sun_direction.x, -camera.sun_direction.z) + 1e-4)
         * (MARCH_LENGTH / float(MARCH_STEPS));
-    float rise = SUN_DIRECTION.y * THICKNESS;
+    float rise = camera.sun_direction.y * THICKNESS;
 
     float visibility = 1.0;
     for (uint i = 1; i <= MARCH_STEPS; ++i)

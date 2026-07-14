@@ -22,7 +22,7 @@ float4 fs_main(VsOut input) : SV_Target
     float3 normal = normalize(cross(ddy(position), ddx(position)));
     float shadow = shadow_mask.Sample(input.uv).r;
 
-    float sun = max(dot(normal, SUN_DIRECTION), 0.0) * shadow;
+    float sun = max(dot(normal, camera.sun_direction), 0.0) * shadow;
     float3 lit = albedo * (0.25 + 0.75 * sun);
     return float4(lit, 1.0);
 }

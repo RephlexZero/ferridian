@@ -14,7 +14,7 @@ use ferridian_pack_compiler::{SlangCompiler, compile_pack, write_artifact};
 use ferridian_testkit::{
     RgbaImage, TestGpu, create_target, read_back, require_gpu, upload_texture,
 };
-use ferridian_vk_rt::{OutputTarget, PackExecutor};
+use ferridian_vk_rt::{CameraUniforms, OutputTarget, PackExecutor};
 
 const SIZE: u32 = 128;
 
@@ -104,6 +104,20 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
             .collect::<Vec<_>>(),
         vec!["shadow_mask", "lit", "fog"]
     );
+    // Camera-consuming passes wire the contract block; composite never
+    // references it, and slangc strips the unused declaration.
+    assert_eq!(
+        plan.passes
+            .iter()
+            .map(|pass| (pass.name.as_str(), pass.camera_binding))
+            .collect::<Vec<_>>(),
+        vec![
+            ("shadows", Some(7)),
+            ("deferred", Some(7)),
+            ("volumetric", Some(7)),
+            ("composite", None),
+        ]
+    );
 
     let mut gpu = TestGpu::new();
     let runtime = gpu.runtime();
@@ -135,6 +149,7 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
             height: SIZE,
         },
         &external_inputs,
+        &CameraUniforms::placeholder(),
         &output,
     )
     .expect("plan instantiates on the device");
@@ -151,6 +166,50 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
     executor.execute(&ctx).expect("pack re-executes");
     let second = read_back(runtime, target.image, SIZE, SIZE);
     assert_eq!(first, second, "two executions produce identical frames");
+
+    // The camera block is live, not baked: pull the far plane in from 512
+    // to 8 view units and the far plateau's fog march collapses — the
+    // fog-dominated bottom half must change dramatically. (The sun direction
+    // would be a poor probe here: the fixture's plateaus face the camera, so
+    // the deferred sun term is already zero.)
+    // SAFETY: execute() fence-waits and read_back fence-waits its own
+    // submission, so nothing in flight is reading the buffer.
+    unsafe {
+        executor
+            .update_camera(
+                gpu.device(),
+                &CameraUniforms {
+                    far_plane: 8.0,
+                    ..CameraUniforms::placeholder()
+                },
+            )
+            .expect("camera updates");
+    }
+    executor
+        .execute(&ctx)
+        .expect("pack executes with a short far plane");
+    let short_range = read_back(runtime, target.image, SIZE, SIZE);
+    let foggy_far = mean_luma(&first, SIZE / 2..SIZE);
+    let short_far = mean_luma(&short_range, SIZE / 2..SIZE);
+    assert!(
+        (foggy_far - short_far).abs() > 25.0,
+        "an 8-unit far plane must collapse the fog march \
+         (far half {foggy_far:.1} vs {short_far:.1})"
+    );
+
+    // And restoring the placeholder restores the exact frame.
+    // SAFETY: as above — the sunless execution was fence-waited.
+    unsafe {
+        executor
+            .update_camera(gpu.device(), &CameraUniforms::placeholder())
+            .expect("camera restores");
+    }
+    executor.execute(&ctx).expect("pack re-executes restored");
+    let restored = read_back(runtime, target.image, SIZE, SIZE);
+    assert_eq!(
+        first, restored,
+        "restoring the camera reproduces the frame exactly"
+    );
 
     // The composite writes alpha = 1 everywhere; anything else means a pass
     // didn't cover the frame.

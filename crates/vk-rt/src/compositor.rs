@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use ash::vk;
+use ferridian_contract::CameraUniforms;
 use ferridian_engine::exec::{ExecutionPlan, WireError, plan_execution};
 use ferridian_engine::pack::LoadedPack;
 
@@ -361,8 +362,13 @@ impl PackCompositor {
                         .map_err(vk_err("create tap image"))
                         .map_err(CompositorError::Exec)?;
                     let requirements = device.get_image_memory_requirements(tap.image);
-                    tap.memory =
-                        allocate(device, &self.memory_properties, requirements, "tap image")?;
+                    tap.memory = allocate(
+                        device,
+                        &self.memory_properties,
+                        requirements,
+                        vk::MemoryPropertyFlags::empty(),
+                        "tap image",
+                    )?;
                     device
                         .bind_image_memory(tap.image, tap.memory, 0)
                         .map_err(vk_err("bind tap memory"))
@@ -412,6 +418,10 @@ impl PackCompositor {
             &self.modules,
             frame.extent,
             &external_inputs,
+            // The layer has no shim channel yet, so packs get the same
+            // placeholder state their constants used to hard-code; real
+            // per-frame values arrive with the shim IPC (tracked follow-up).
+            &CameraUniforms::placeholder(),
             &output,
         ) {
             Ok(executor) => Ok(Built {

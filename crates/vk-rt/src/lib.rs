@@ -10,6 +10,8 @@ pub mod tap;
 pub use capability::{CapabilityTier, DeviceProfile, capability_tier};
 pub use compositor::{CompositorError, PackCompositor};
 pub use exec::{ExecContext, ExecError, OutputTarget, PackExecutor};
+/// Re-exported so executor callers get the camera type from the same crate.
+pub use ferridian_contract::CameraUniforms;
 pub use tap::{ResolvedAttachment, ResolvedFrame, TapRegistry, ViewRecord};
 
 use std::ffi::{CStr, CString, c_char, c_void};

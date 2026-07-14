@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 
 use ash::vk;
+use ferridian_contract::CameraUniforms;
 use ferridian_engine::exec::{ExecutionPlan, PassPlan, SWAPCHAIN};
 
 /// Format of every executor-created intermediate resource. Float, because
@@ -62,10 +63,20 @@ pub enum ExecError {
     NoMemoryType { what: &'static str, type_bits: u32 },
     #[error("entry point name {0:?} has an interior NUL byte")]
     BadEntryPointName(String),
+    #[error("pass {0:?} binds the camera but no camera buffer was created")]
+    CameraMissing(String),
 }
 
 pub(crate) fn vk_err(what: &'static str) -> impl FnOnce(vk::Result) -> ExecError {
     move |result| ExecError::Vk { what, result }
+}
+
+/// The contract camera uniform block, one buffer shared by every pass that
+/// binds it (host-visible + coherent, rewritten via
+/// [`PackExecutor::update_camera`]).
+struct CameraBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
 }
 
 /// One executor-owned image (an intermediate pass resource).
@@ -92,6 +103,7 @@ struct PassResources {
 pub struct PackExecutor {
     extent: vk::Extent2D,
     sampler: vk::Sampler,
+    camera: Option<CameraBuffer>,
     intermediates: Vec<Intermediate>,
     descriptor_pool: vk::DescriptorPool,
     passes: Vec<PassResources>,
@@ -103,25 +115,29 @@ impl PackExecutor {
     /// Instantiate `plan` on the device. `modules` are the loaded pack's
     /// SPIR-V words per pass; `external_inputs` must contain a view per
     /// resource in `plan.external_inputs`, already in
-    /// `SHADER_READ_ONLY_OPTIMAL` and visible to fragment sampling.
+    /// `SHADER_READ_ONLY_OPTIMAL` and visible to fragment sampling; `camera`
+    /// is the initial value of the contract camera block (updated later via
+    /// [`PackExecutor::update_camera`]) — ignored if no pass binds it.
     pub fn new(
         ctx: &ExecContext<'_>,
         plan: &ExecutionPlan,
         modules: &BTreeMap<String, Vec<u32>>,
         extent: vk::Extent2D,
         external_inputs: &BTreeMap<String, vk::ImageView>,
+        camera: &CameraUniforms,
         output: &OutputTarget,
     ) -> Result<PackExecutor, ExecError> {
         let mut executor = PackExecutor {
             extent,
             sampler: vk::Sampler::null(),
+            camera: None,
             intermediates: Vec::new(),
             descriptor_pool: vk::DescriptorPool::null(),
             passes: Vec::new(),
             command_pool: vk::CommandPool::null(),
             fence: vk::Fence::null(),
         };
-        match executor.build(ctx, plan, modules, external_inputs, output) {
+        match executor.build(ctx, plan, modules, external_inputs, camera, output) {
             Ok(()) => Ok(executor),
             Err(error) => {
                 // SAFETY: nothing has been submitted yet, so no in-flight
@@ -138,6 +154,7 @@ impl PackExecutor {
         plan: &ExecutionPlan,
         modules: &BTreeMap<String, Vec<u32>>,
         external_inputs: &BTreeMap<String, vk::ImageView>,
+        camera: &CameraUniforms,
         output: &OutputTarget,
     ) -> Result<(), ExecError> {
         let device = ctx.device;
@@ -192,6 +209,7 @@ impl PackExecutor {
                     device,
                     &ctx.memory_properties,
                     requirements,
+                    vk::MemoryPropertyFlags::empty(),
                     "intermediate image",
                 )?;
                 device
@@ -224,14 +242,66 @@ impl PackExecutor {
             views.insert(name.clone(), view);
         }
 
+        // One camera buffer serves every pass that binds the block.
+        let camera_bindings: u32 = plan
+            .passes
+            .iter()
+            .filter(|pass| pass.camera_binding.is_some())
+            .count() as u32;
+        if camera_bindings > 0 {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(CameraUniforms::STD140_SIZE as u64)
+                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER);
+            // Slot-first like the intermediates: destroy() reaches whatever
+            // was created if a later step fails.
+            self.camera = Some(CameraBuffer {
+                buffer: vk::Buffer::null(),
+                memory: vk::DeviceMemory::null(),
+            });
+            let Some(slot) = self.camera.as_mut() else {
+                unreachable!("assigned above");
+            };
+            // SAFETY: see the block comment on sampler creation.
+            unsafe {
+                slot.buffer = device
+                    .create_buffer(&buffer_info, None)
+                    .map_err(vk_err("create camera buffer"))?;
+                let requirements = device.get_buffer_memory_requirements(slot.buffer);
+                slot.memory = allocate(
+                    device,
+                    &ctx.memory_properties,
+                    requirements,
+                    // Host-visible + coherent: rewritten from the CPU each
+                    // camera update, read as a 32-byte uniform block —
+                    // device-local placement buys nothing at this size.
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    "camera uniform buffer",
+                )?;
+                device
+                    .bind_buffer_memory(slot.buffer, slot.memory, 0)
+                    .map_err(vk_err("bind camera memory"))?;
+                // Nothing is submitted yet, so the initial write is safe.
+                self.update_camera(device, camera)?;
+            }
+        }
+
         let total_bindings: u32 = plan
             .passes
             .iter()
             .map(|pass| pass.bindings.len() as u32)
             .sum();
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(total_bindings.max(1))];
+        let mut pool_sizes = vec![
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(total_bindings.max(1)),
+        ];
+        if camera_bindings > 0 {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(camera_bindings),
+            );
+        }
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(plan.passes.len().max(1) as u32)
             .pool_sizes(&pool_sizes);
@@ -290,7 +360,7 @@ impl PackExecutor {
         // On failure, hand the partial resources to `self` so destroy()
         // reaches them; a closure-based try block keeps that in one place.
         let result = (|| {
-            let layout_bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = pass
+            let mut layout_bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = pass
                 .bindings
                 .iter()
                 .map(|binding| {
@@ -301,6 +371,17 @@ impl PackExecutor {
                         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 })
                 .collect();
+            if let Some(slot) = pass.camera_binding {
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(slot)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        // Fragment-only today, but vertex access is free to
+                        // declare and packs will want it.
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
+                );
+            }
             let set_layout_info =
                 vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
             // SAFETY: one linear sequence of creates against a live device;
@@ -473,7 +554,22 @@ impl PackExecutor {
                                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)])
                         })
                         .collect::<Result<_, ExecError>>()?;
-                let writes: Vec<vk::WriteDescriptorSet<'_>> = pass
+                let camera_info = match pass.camera_binding {
+                    Some(_) => {
+                        let camera = self
+                            .camera
+                            .as_ref()
+                            // Unreachable: build() created the buffer from
+                            // the same plan. Runtime code, so still an error.
+                            .ok_or_else(|| ExecError::CameraMissing(pass.name.clone()))?;
+                        Some([vk::DescriptorBufferInfo::default()
+                            .buffer(camera.buffer)
+                            .offset(0)
+                            .range(CameraUniforms::STD140_SIZE as u64)])
+                    }
+                    None => None,
+                };
+                let mut writes: Vec<vk::WriteDescriptorSet<'_>> = pass
                     .bindings
                     .iter()
                     .zip(&image_infos)
@@ -485,6 +581,15 @@ impl PackExecutor {
                             .image_info(info)
                     })
                     .collect();
+                if let (Some(slot), Some(info)) = (pass.camera_binding, camera_info.as_ref()) {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(resources.descriptor_set)
+                            .dst_binding(slot)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .buffer_info(info),
+                    );
+                }
                 device.update_descriptor_sets(&writes, &[]);
             }
             Ok(())
@@ -496,6 +601,39 @@ impl PackExecutor {
                 Err(error)
             }
         }
+    }
+
+    /// Overwrite the contract camera block. A no-op when the pack never
+    /// binds the camera.
+    ///
+    /// # Safety
+    /// No submitted work may still be reading the buffer — either wait the
+    /// frame that sampled it (as [`PackExecutor::execute`]'s fence does) or
+    /// only call this before work is submitted.
+    pub unsafe fn update_camera(
+        &self,
+        device: &ash::Device,
+        camera: &CameraUniforms,
+    ) -> Result<(), ExecError> {
+        let Some(buffer) = &self.camera else {
+            return Ok(());
+        };
+        let bytes = camera.to_std140_bytes();
+        // SAFETY: the memory is HOST_VISIBLE|HOST_COHERENT and exactly
+        // STD140_SIZE bytes; the caller guarantees no in-flight readers.
+        unsafe {
+            let ptr = device
+                .map_memory(
+                    buffer.memory,
+                    0,
+                    CameraUniforms::STD140_SIZE as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(vk_err("map camera memory"))?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            device.unmap_memory(buffer.memory);
+        }
+        Ok(())
     }
 
     /// Record the whole schedule into `command_buffer`: for each pass, one
@@ -616,18 +754,24 @@ impl PackExecutor {
                 device.destroy_image(intermediate.image, None);
                 device.free_memory(intermediate.memory, None);
             }
+            if let Some(camera) = self.camera.take() {
+                device.destroy_buffer(camera.buffer, None);
+                device.free_memory(camera.memory, None);
+            }
             device.destroy_sampler(self.sampler, None);
             self.sampler = vk::Sampler::null();
         }
     }
 }
 
-/// Dedicated device-local allocation with fallback to any compatible type
-/// (lavapipe advertises everything host-visible).
+/// Dedicated allocation: whatever the caller requires, preferring
+/// device-local among the qualifying types (lavapipe advertises everything
+/// host-visible, so both picks usually agree there).
 pub(crate) fn allocate(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     requirements: vk::MemoryRequirements,
+    required: vk::MemoryPropertyFlags,
     what: &'static str,
 ) -> Result<vk::DeviceMemory, ExecError> {
     let pick = |must_have: vk::MemoryPropertyFlags| {
@@ -639,8 +783,8 @@ pub(crate) fn allocate(
                     && memory_type.property_flags.contains(must_have)
             })
     };
-    let type_index = pick(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        .or_else(|| pick(vk::MemoryPropertyFlags::empty()))
+    let type_index = pick(required | vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .or_else(|| pick(required))
         .ok_or(ExecError::NoMemoryType {
             what,
             type_bits: requirements.memory_type_bits,
