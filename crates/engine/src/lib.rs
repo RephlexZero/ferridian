@@ -5,6 +5,8 @@
 //! reach as much of the engine as physics allows. Device work lives in
 //! `ferridian-vk-rt`; interception lives in `ferridian-vk-layer`.
 
+pub mod frame;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A resource name flowing between passes ("game_color", "shadow_map", …).
