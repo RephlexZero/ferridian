@@ -71,6 +71,11 @@ Follow-ups tracked toward M2+:
 - [ ] Reference pack buildout: shadows + deferred + one volumetric (M3)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
-- [ ] GPU-assisted validation in nightly once verified against lavapipe
+- [ ] GPU-assisted validation in nightly — verified 2026-07-14 and **blocked**:
+      VVL cannot instrument slangc's mixed-stage modules ("Mixed stage shader
+      module not supported"), and its on-disk shader_validation_cache masks
+      that error on every run after the first (delete
+      `~/.cache/{instrumented_shader,shader_validation}_cache*` to reproduce).
+      Needs per-stage module emission in pack-compiler first
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
 - [ ] Photon port permission outreach (human task, before any port work)
