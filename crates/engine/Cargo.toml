@@ -13,5 +13,11 @@ workspace = true
 
 [dependencies]
 ferridian-contract = { workspace = true }
+ferridian-pack-format = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The reload integration test proves the generation handshake against the
+# real producer (`packc serve`'s write side) instead of a re-implementation.
+ferridian-pack-compiler = { workspace = true }

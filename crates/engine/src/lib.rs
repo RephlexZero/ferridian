@@ -6,6 +6,7 @@
 //! `ferridian-vk-rt`; interception lives in `ferridian-vk-layer`.
 
 pub mod frame;
+pub mod pack;
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -267,6 +267,8 @@ name = "ferridian-engine"
 version = "0.1.0"
 dependencies = [
  "ferridian-contract",
+ "ferridian-pack-compiler",
+ "ferridian-pack-format",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -300,6 +302,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash",
+ "ferridian-engine",
  "ferridian-pack-compiler",
  "ferridian-vk-rt",
  "png",

@@ -80,6 +80,10 @@ pub enum ManifestError {
     UnknownInput { pass: String, input: String },
     #[error("pass {pass} has an empty shader path")]
     EmptyShaderPath { pass: String },
+    #[error(
+        "invalid pass name {0:?}: pass names become artifact file names, only [A-Za-z0-9_-] is allowed"
+    )]
+    InvalidPassName(String),
 }
 
 impl PackManifest {
@@ -106,6 +110,17 @@ impl PackManifest {
         let mut produced: Vec<&str> = BUILTIN_RESOURCES.to_vec();
         let mut names: Vec<&str> = Vec::new();
         for pass in &self.passes {
+            // Pass names name artifact files (`<name>.spv`) and manifests are
+            // untrusted, so a name must be a single benign path component —
+            // no separators, no "..", no empty string.
+            if pass.name.is_empty()
+                || !pass
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(ManifestError::InvalidPassName(pass.name.clone()));
+            }
             if names.contains(&pass.name.as_str()) {
                 return Err(ManifestError::DuplicatePass(pass.name.clone()));
             }
@@ -183,6 +198,19 @@ mod tests {
             dup.validate(),
             Err(ManifestError::DuplicatePass("composite".to_owned()))
         );
+    }
+
+    #[test]
+    fn rejects_path_traversal_pass_names() {
+        for hostile in ["../evil", "a/b", "a\\b", "", ".."] {
+            let mut manifest = PackManifest::from_toml_str(MINIMAL).unwrap();
+            manifest.passes[0].name = hostile.to_owned();
+            assert_eq!(
+                manifest.validate(),
+                Err(ManifestError::InvalidPassName(hostile.to_owned())),
+                "pass name {hostile:?} must be rejected"
+            );
+        }
     }
 
     #[test]

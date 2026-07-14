@@ -22,7 +22,8 @@ outputs = ["swapchain"]
 
 Rules enforced at build time:
 
-- Pass names are unique.
+- Pass names are unique, and use only `[A-Za-z0-9_-]` (they become artifact
+  file names).
 - Every `input` is a builtin (`game_color`, `game_depth`, `swapchain`) or the
   `output` of an earlier pass.
 - Each resource has exactly one writer.
