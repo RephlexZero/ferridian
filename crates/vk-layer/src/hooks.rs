@@ -42,10 +42,11 @@ pub(crate) fn device_destroyed() {
     tracing::debug!("ferridian layer: device destroyed");
 }
 
-pub(crate) fn render_pass_begun() {
+pub(crate) fn render_pass_begun() -> GamePassKind {
     RENDER_PASSES_BEGUN.fetch_add(1, Ordering::Relaxed);
     let kind = with_observer(|observer| observer.render_pass_begun());
     tracing::trace!(kind = kind.as_str(), "ferridian layer: render pass begun");
+    kind
 }
 
 pub(crate) fn label_begun(name: &str) {

@@ -10,9 +10,11 @@
 //! where only a `VkCommandBuffer` is in hand.
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use ash::vk;
+
+use crate::overlay::Overlay;
 
 pub(crate) type PfnDestroyInstance =
     for<'a> unsafe extern "system" fn(vk::Instance, *const vk::AllocationCallbacks<'a>);
@@ -25,6 +27,8 @@ pub(crate) type PfnCmdBeginRenderPass = for<'a> unsafe extern "system" fn(
     *const vk::RenderPassBeginInfo<'a>,
     vk::SubpassContents,
 );
+
+pub(crate) type PfnCmdEndRenderPass = unsafe extern "system" fn(vk::CommandBuffer);
 
 pub(crate) type PfnCmdBeginDebugUtilsLabel =
     for<'a> unsafe extern "system" fn(vk::CommandBuffer, *const vk::DebugUtilsLabelEXT<'a>);
@@ -46,8 +50,12 @@ pub(crate) struct DeviceState {
     pub gdpa: vk::PFN_vkGetDeviceProcAddr,
     pub destroy_device: PfnDestroyDevice,
     pub cmd_begin_render_pass: Option<PfnCmdBeginRenderPass>,
+    pub cmd_end_render_pass: Option<PfnCmdEndRenderPass>,
     pub cmd_begin_debug_utils_label: Option<PfnCmdBeginDebugUtilsLabel>,
     pub cmd_end_debug_utils_label: Option<PfnCmdEndDebugUtilsLabel>,
+    /// The compositor's per-device Vulkan objects; `None` when creation
+    /// failed (compositing then stays off for this device).
+    pub overlay: Mutex<Option<Overlay>>,
 }
 
 static INSTANCES: RwLock<BTreeMap<usize, InstanceState>> = RwLock::new(BTreeMap::new());

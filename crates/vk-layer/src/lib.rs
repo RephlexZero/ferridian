@@ -14,22 +14,27 @@
 mod dispatch;
 mod hooks;
 mod loader_interface;
+mod overlay;
 
 pub use loader_interface::LAYER_NAME;
 
 use std::ffi::{CStr, c_char};
+use std::sync::Mutex;
 
 use ash::vk;
 use ash::vk::Handle;
+use ferridian_contract::GamePassKind;
 
 use dispatch::{
     DeviceState, InstanceState, PfnCmdBeginDebugUtilsLabel, PfnCmdBeginRenderPass,
-    PfnCmdEndDebugUtilsLabel, PfnDestroyDevice, PfnDestroyInstance, dispatch_key,
+    PfnCmdEndDebugUtilsLabel, PfnCmdEndRenderPass, PfnDestroyDevice, PfnDestroyInstance,
+    dispatch_key,
 };
 use loader_interface::{
     LayerFunction, NEGOTIATE_INTERFACE_STRUCT, PfnCreateDevice, PfnCreateInstance,
     VkLayerDeviceCreateInfo, VkLayerInstanceCreateInfo, VkNegotiateLayerInterface,
 };
+use overlay::{ActivePass, Overlay};
 
 /// Render passes begun through the layer, readable across the cdylib
 /// boundary (tests dlopen the layer and assert interception actually
@@ -137,6 +142,9 @@ pub unsafe extern "system" fn ferridian_get_device_proc_addr(
         b"vkCmdBeginRenderPass" => {
             as_void_pfn!(PfnCmdBeginRenderPass, ferridian_cmd_begin_render_pass)
         }
+        b"vkCmdEndRenderPass" => {
+            as_void_pfn!(PfnCmdEndRenderPass, ferridian_cmd_end_render_pass)
+        }
         b"vkCmdBeginDebugUtilsLabelEXT" => as_void_pfn!(
             PfnCmdBeginDebugUtilsLabel,
             ferridian_cmd_begin_debug_utils_label
@@ -164,7 +172,21 @@ unsafe extern "system" fn ferridian_cmd_begin_render_pass(
     p_render_pass_begin: *const vk::RenderPassBeginInfo<'_>,
     contents: vk::SubpassContents,
 ) {
-    hooks::render_pass_begun();
+    let kind = hooks::render_pass_begun();
+    if !p_render_pass_begin.is_null() {
+        // SAFETY: a non-null begin info is live for the duration of the call.
+        let begin = unsafe { &*p_render_pass_begin };
+        overlay::pass_begun(
+            command_buffer,
+            ActivePass {
+                render_pass: begin.render_pass,
+                render_area: begin.render_area,
+                // The compositor only ever touches passes the contract
+                // classified; Unknown is forwarded untouched.
+                composite: kind != GamePassKind::Unknown,
+            },
+        );
+    }
     // SAFETY: command buffers are dispatchable handles carrying their
     // device's dispatch key.
     let key = unsafe { dispatch_key(command_buffer.as_raw()) };
@@ -173,6 +195,28 @@ unsafe extern "system" fn ferridian_cmd_begin_render_pass(
         // SAFETY: forwarding the caller's (still valid) arguments down the chain.
         unsafe { next(command_buffer, p_render_pass_begin, contents) };
     }
+}
+
+/// # Safety
+/// Standard `vkCmdEndRenderPass` contract; called by the dispatch chain
+/// only after our GDPA handed this pointer out.
+unsafe extern "system" fn ferridian_cmd_end_render_pass(command_buffer: vk::CommandBuffer) {
+    let pass = overlay::pass_ending(command_buffer);
+    // SAFETY: dispatchable handle; see ferridian_cmd_begin_render_pass.
+    let key = unsafe { dispatch_key(command_buffer.as_raw()) };
+    dispatch::with_device(key, |state| {
+        if let Some(pass) = pass.as_ref().filter(|pass| pass.composite) {
+            let mut overlay = state.overlay.lock().expect("overlay lock poisoned");
+            if let Some(overlay) = overlay.as_mut() {
+                // Inject *before* the pass closes, after every app draw in it.
+                overlay.composite(command_buffer, pass);
+            }
+        }
+        if let Some(next) = state.cmd_end_render_pass {
+            // SAFETY: forwarding the caller's (still valid) argument down the chain.
+            unsafe { next(command_buffer) };
+        }
+    });
 }
 
 /// # Safety
@@ -393,6 +437,7 @@ unsafe extern "system" fn ferridian_create_device(
             gdpa: next_gdpa,
             destroy_device,
             cmd_begin_render_pass: retype!(resolve(c"vkCmdBeginRenderPass"), PfnCmdBeginRenderPass),
+            cmd_end_render_pass: retype!(resolve(c"vkCmdEndRenderPass"), PfnCmdEndRenderPass),
             cmd_begin_debug_utils_label: retype!(
                 resolve(c"vkCmdBeginDebugUtilsLabelEXT"),
                 PfnCmdBeginDebugUtilsLabel
@@ -401,6 +446,7 @@ unsafe extern "system" fn ferridian_create_device(
                 resolve(c"vkCmdEndDebugUtilsLabelEXT"),
                 PfnCmdEndDebugUtilsLabel
             ),
+            overlay: Mutex::new(Overlay::new(next_gdpa, device)),
         },
     );
     hooks::device_created();
@@ -422,6 +468,16 @@ unsafe extern "system" fn ferridian_destroy_device(
         // Not ours (or already gone) — nothing to forward to.
         return;
     };
+    // The overlay's child objects must die before their device does (VVL
+    // reports them as leaked at vkDestroyDevice otherwise).
+    if let Some(overlay) = state
+        .overlay
+        .lock()
+        .expect("overlay lock poisoned")
+        .as_mut()
+    {
+        overlay.destroy();
+    }
     hooks::device_destroyed();
     // SAFETY: forwarding the destroy down the chain exactly once.
     unsafe { (state.destroy_device)(device, p_allocator) };

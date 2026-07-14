@@ -90,8 +90,9 @@ fn boot_layered_runtime() -> VkRuntime {
     .expect("boot lavapipe with the Ferridian layer + validation enabled")
 }
 
-/// Drive a real draw through the layered dispatch chain.
-fn render_gradient(runtime: &VkRuntime, pass_label: Option<&str>) {
+/// Drive a real draw through the layered dispatch chain and return the
+/// readback.
+fn render_gradient(runtime: &VkRuntime, pass_label: Option<&str>) -> ferridian_testkit::RgbaImage {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testkit/fixtures/gradient.slang");
     let compiler = ferridian_pack_compiler::SlangCompiler::from_environment()
@@ -115,7 +116,19 @@ fn render_gradient(runtime: &VkRuntime, pass_label: Option<&str>) {
         },
     );
     assert_eq!(image.pixels.len(), 64 * 64 * 4);
+    image
 }
+
+/// One RGBA pixel out of a 64×64 readback.
+fn pixel(image: &ferridian_testkit::RgbaImage, x: usize, y: usize) -> [u8; 4] {
+    let offset = (y * 64 + x) * 4;
+    image.pixels[offset..offset + 4]
+        .try_into()
+        .expect("4 bytes per pixel")
+}
+
+/// The overlay shader's solid fill — see crates/vk-layer/shaders/overlay.slang.
+const OVERLAY_MAGENTA: [u8; 4] = [255, 0, 255, 255];
 
 /// The loader loaded its own copy of the cdylib; dlopen the same file to
 /// reach that copy's exported counters (dlopen refcounts, same handle).
@@ -181,11 +194,12 @@ fn layer_loads_intercepts_and_classifies_validation_clean() {
         .game_anchor;
 
     let runtime = boot_layered_runtime();
-    render_gradient(&runtime, Some(terrain_anchor));
+    let classified = render_gradient(&runtime, Some(terrain_anchor));
+    let unclassified = render_gradient(&runtime, None);
 
     let probe = LayerProbe::new(&dylib);
     assert!(
-        probe.render_pass_count() >= 1,
+        probe.render_pass_count() >= 2,
         "the layer sits in the dispatch chain but never saw vkCmdBeginRenderPass"
     );
     assert!(
@@ -196,6 +210,24 @@ fn layer_loads_intercepts_and_classifies_validation_clean() {
         probe.classified_count(GamePassKind::Sky),
         0,
         "no sky-anchored label was ever pushed"
+    );
+
+    // Composite over the intercepted frame: the classified pass carries the
+    // layer's magenta corner overlay; the unclassified pass is untouched.
+    assert_eq!(
+        pixel(&classified, 2, 2),
+        OVERLAY_MAGENTA,
+        "the terrain-classified pass should carry the overlay in its corner"
+    );
+    assert_ne!(
+        pixel(&classified, 60, 60),
+        OVERLAY_MAGENTA,
+        "the overlay must stay in its corner, not repaint the frame"
+    );
+    assert_ne!(
+        pixel(&unclassified, 2, 2),
+        OVERLAY_MAGENTA,
+        "an Unknown pass must be forwarded untouched — unknown never means composite"
     );
 
     assert_validation_clean(&runtime, "with the layer active");
