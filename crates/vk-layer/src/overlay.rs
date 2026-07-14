@@ -17,11 +17,11 @@
 //! from intercepted vkCreateRenderPass.
 
 use std::collections::BTreeMap;
-use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use ash::vk;
 use ash::vk::Handle;
+use ferridian_contract::GamePassKind;
 
 static OVERLAY_SPV: &[u8] = include_bytes!("../shaders/overlay.spv");
 
@@ -39,8 +39,17 @@ fn overlay_words() -> &'static [u32] {
 /// the command buffer's raw handle (unique among live command buffers).
 pub(crate) struct ActivePass {
     pub render_pass: vk::RenderPass,
+    pub framebuffer: vk::Framebuffer,
     pub render_area: vk::Rect2D,
-    pub composite: bool,
+    /// How the contract classified this pass; the compositors only ever
+    /// touch classified passes — Unknown is forwarded untouched.
+    pub kind: GamePassKind,
+}
+
+impl ActivePass {
+    pub(crate) fn classified(&self) -> bool {
+        self.kind != GamePassKind::Unknown
+    }
 }
 
 static PASSES_IN_FLIGHT: Mutex<BTreeMap<u64, ActivePass>> = Mutex::new(BTreeMap::new());
@@ -71,23 +80,10 @@ pub(crate) struct Overlay {
 }
 
 impl Overlay {
-    /// Load the down-chain device table and create the pass-independent
-    /// objects. `None` (logged) disables compositing for this device.
-    pub(crate) fn new(gdpa: vk::PFN_vkGetDeviceProcAddr, device: vk::Device) -> Option<Overlay> {
-        // SAFETY: loading the *down-chain* table for a device that was just
-        // created successfully; missing functions become panicking stubs we
-        // only reach if we call an unsupported command (we stick to core 1.0).
-        let device = unsafe {
-            ash::Device::load_with(
-                |name| {
-                    std::mem::transmute::<vk::PFN_vkVoidFunction, *const c_void>(gdpa(
-                        device,
-                        name.as_ptr(),
-                    ))
-                },
-                device,
-            )
-        };
+    /// Create the pass-independent objects on the *down-chain* device table
+    /// (calls through it never re-enter the layer). `None` (logged) disables
+    /// the overlay for this device.
+    pub(crate) fn new(device: ash::Device) -> Option<Overlay> {
         let module_info = vk::ShaderModuleCreateInfo::default().code(overlay_words());
         // SAFETY: valid create info over the embedded (build-verified) SPIR-V.
         let shader_module = match unsafe { device.create_shader_module(&module_info, None) } {

@@ -4,11 +4,20 @@
 //! functions; `ferridian-engine` never sees loader plumbing, and this module
 //! never grows logic — classification lives in [`ferridian_engine::frame`].
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ash::vk;
 use ferridian_contract::{Contract, GamePassKind};
 use ferridian_engine::frame::PassObserver;
+use ferridian_engine::pack::load_pack;
+use ferridian_vk_rt::PackCompositor;
+
+/// Artifact directory to composite over intercepted frames. Read once per
+/// device creation; hot reload through the layer is a follow-up (the engine's
+/// `PackWatcher` is ready for it, the layer needs a safe swap point first).
+pub const PACK_ENV: &str = "FERRIDIAN_PACK";
 
 /// Render passes begun through the layer since load. The first observable
 /// fact the layer extracts from a host application.
@@ -36,6 +45,38 @@ pub(crate) fn instance_destroyed() {
 
 pub(crate) fn device_created() {
     tracing::debug!("ferridian layer: device created");
+}
+
+/// Load and wire the pack named by [`PACK_ENV`], if any. Every failure is a
+/// warning and `None` — a broken pack must never take the game down with it.
+pub(crate) fn create_compositor(
+    device: ash::Device,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+) -> Option<PackCompositor> {
+    let dir = std::env::var_os(PACK_ENV)?;
+    let pack = match load_pack(Path::new(&dir), 0) {
+        Ok(pack) => pack,
+        Err(error) => {
+            tracing::warn!(%error, pack = %dir.to_string_lossy(), "pack failed to load; compositing disabled");
+            return None;
+        }
+    };
+    match PackCompositor::new(device, queue, queue_family_index, memory_properties, &pack) {
+        Ok(compositor) => {
+            tracing::info!(
+                pack = %dir.to_string_lossy(),
+                passes = compositor.pass_count(),
+                "pack loaded and wired; compositing armed"
+            );
+            Some(compositor)
+        }
+        Err(error) => {
+            tracing::warn!(%error, pack = %dir.to_string_lossy(), "pack does not wire; compositing disabled");
+            None
+        }
+    }
 }
 
 pub(crate) fn device_destroyed() {

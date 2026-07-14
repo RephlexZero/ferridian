@@ -16,19 +16,22 @@ mod hooks;
 mod loader_interface;
 mod overlay;
 
+pub use hooks::PACK_ENV;
 pub use loader_interface::LAYER_NAME;
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
 
 use ash::vk;
 use ash::vk::Handle;
-use ferridian_contract::GamePassKind;
+use ferridian_engine::frame::composite_trigger;
+use ferridian_vk_rt::{TapRegistry, ViewRecord};
 
 use dispatch::{
     DeviceState, InstanceState, PfnCmdBeginDebugUtilsLabel, PfnCmdBeginRenderPass,
-    PfnCmdEndDebugUtilsLabel, PfnCmdEndRenderPass, PfnDestroyDevice, PfnDestroyInstance,
-    dispatch_key,
+    PfnCmdEndDebugUtilsLabel, PfnCmdEndRenderPass, PfnCreateFramebuffer, PfnCreateImageView,
+    PfnCreateRenderPass, PfnDestroyDevice, PfnDestroyFramebuffer, PfnDestroyImageView,
+    PfnDestroyInstance, PfnDestroyRenderPass, dispatch_key,
 };
 use loader_interface::{
     LayerFunction, NEGOTIATE_INTERFACE_STRUCT, PfnCreateDevice, PfnCreateInstance,
@@ -153,6 +156,16 @@ pub unsafe extern "system" fn ferridian_get_device_proc_addr(
             PfnCmdEndDebugUtilsLabel,
             ferridian_cmd_end_debug_utils_label
         ),
+        b"vkCreateImageView" => as_void_pfn!(PfnCreateImageView, ferridian_create_image_view),
+        b"vkDestroyImageView" => as_void_pfn!(PfnDestroyImageView, ferridian_destroy_image_view),
+        b"vkCreateFramebuffer" => as_void_pfn!(PfnCreateFramebuffer, ferridian_create_framebuffer),
+        b"vkDestroyFramebuffer" => {
+            as_void_pfn!(PfnDestroyFramebuffer, ferridian_destroy_framebuffer)
+        }
+        b"vkCreateRenderPass" => as_void_pfn!(PfnCreateRenderPass, ferridian_create_render_pass),
+        b"vkDestroyRenderPass" => {
+            as_void_pfn!(PfnDestroyRenderPass, ferridian_destroy_render_pass)
+        }
         _ => {
             // SAFETY: a non-null device handle passed to GDPA is live and
             // dispatchable per the Vulkan spec.
@@ -180,10 +193,9 @@ unsafe extern "system" fn ferridian_cmd_begin_render_pass(
             command_buffer,
             ActivePass {
                 render_pass: begin.render_pass,
+                framebuffer: begin.framebuffer,
                 render_area: begin.render_area,
-                // The compositor only ever touches passes the contract
-                // classified; Unknown is forwarded untouched.
-                composite: kind != GamePassKind::Unknown,
+                kind,
             },
         );
     }
@@ -205,7 +217,14 @@ unsafe extern "system" fn ferridian_cmd_end_render_pass(command_buffer: vk::Comm
     // SAFETY: dispatchable handle; see ferridian_cmd_begin_render_pass.
     let key = unsafe { dispatch_key(command_buffer.as_raw()) };
     dispatch::with_device(key, |state| {
-        if let Some(pass) = pass.as_ref().filter(|pass| pass.composite) {
+        let pack_active = state
+            .compositor
+            .lock()
+            .expect("compositor lock poisoned")
+            .is_some();
+        // The embedded overlay is the no-pack walking skeleton; a loaded
+        // pack replaces it outright.
+        if !pack_active && let Some(pass) = pass.as_ref().filter(|pass| pass.classified()) {
             let mut overlay = state.overlay.lock().expect("overlay lock poisoned");
             if let Some(overlay) = overlay.as_mut() {
                 // Inject *before* the pass closes, after every app draw in it.
@@ -215,6 +234,23 @@ unsafe extern "system" fn ferridian_cmd_end_render_pass(command_buffer: vk::Comm
         if let Some(next) = state.cmd_end_render_pass {
             // SAFETY: forwarding the caller's (still valid) argument down the chain.
             unsafe { next(command_buffer) };
+        }
+        // The pack runs *after* the world-final pass has closed: its own
+        // render passes cannot nest inside the app's.
+        if let Some(pass) = pass.as_ref().filter(|pass| composite_trigger(pass.kind)) {
+            let resolved = state
+                .taps
+                .lock()
+                .expect("tap registry poisoned")
+                .resolve(pass.render_pass, pass.framebuffer);
+            let mut compositor = state.compositor.lock().expect("compositor lock poisoned");
+            if let (Some(compositor), Some(frame)) = (compositor.as_mut(), resolved) {
+                // SAFETY: we are on the app's recording thread, immediately
+                // after its render pass ended in this command buffer.
+                unsafe { compositor.record_over(command_buffer, &frame) };
+            } else if pack_active {
+                tracing::debug!("trigger pass not resolvable to attachments; frame left untouched");
+            }
         }
     });
 }
@@ -256,6 +292,204 @@ unsafe extern "system" fn ferridian_cmd_end_debug_utils_label(command_buffer: vk
         // SAFETY: forwarding the caller's (still valid) argument down the chain.
         unsafe { next(command_buffer) };
     }
+}
+
+/// # Safety
+/// Standard `vkCreateImageView` contract.
+unsafe extern "system" fn ferridian_create_image_view(
+    device: vk::Device,
+    p_create_info: *const vk::ImageViewCreateInfo<'_>,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+    p_view: *mut vk::ImageView,
+) -> vk::Result {
+    // SAFETY: a non-null device passed to a device command is live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    let Some(Some(next)) = dispatch::with_device(key, |state| state.create_image_view) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+    let result = unsafe { next(device, p_create_info, p_allocator, p_view) };
+    if result == vk::Result::SUCCESS && !p_create_info.is_null() && !p_view.is_null() {
+        // SAFETY: create info and out-pointer are valid per the contract; the
+        // create succeeded so *p_view holds the new handle.
+        let (info, view) = unsafe { (&*p_create_info, *p_view) };
+        dispatch::with_device(key, |state| {
+            state
+                .taps
+                .lock()
+                .expect("tap registry poisoned")
+                .record_view(
+                    view,
+                    ViewRecord {
+                        image: info.image,
+                        format: info.format,
+                        aspect: info.subresource_range.aspect_mask,
+                    },
+                );
+        });
+    }
+    result
+}
+
+/// # Safety
+/// Standard `vkDestroyImageView` contract.
+unsafe extern "system" fn ferridian_destroy_image_view(
+    device: vk::Device,
+    view: vk::ImageView,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    // SAFETY: a non-null device passed to a device command is live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    dispatch::with_device(key, |state| {
+        if view != vk::ImageView::null() {
+            let mut compositor = state.compositor.lock().expect("compositor lock poisoned");
+            if let Some(compositor) = compositor.as_mut() {
+                // SAFETY: called from the vkDestroyImageView hook before
+                // forwarding, exactly this method's contract.
+                unsafe { compositor.invalidate_view(view) };
+            }
+            state
+                .taps
+                .lock()
+                .expect("tap registry poisoned")
+                .forget_view(view);
+        }
+        if let Some(next) = state.destroy_image_view {
+            // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+            unsafe { next(device, view, p_allocator) };
+        }
+    });
+}
+
+/// # Safety
+/// Standard `vkCreateFramebuffer` contract.
+unsafe extern "system" fn ferridian_create_framebuffer(
+    device: vk::Device,
+    p_create_info: *const vk::FramebufferCreateInfo<'_>,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+    p_framebuffer: *mut vk::Framebuffer,
+) -> vk::Result {
+    // SAFETY: a non-null device passed to a device command is live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    let Some(Some(next)) = dispatch::with_device(key, |state| state.create_framebuffer) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+    let result = unsafe { next(device, p_create_info, p_allocator, p_framebuffer) };
+    if result == vk::Result::SUCCESS && !p_create_info.is_null() && !p_framebuffer.is_null() {
+        // SAFETY: create info and out-pointer are valid per the contract.
+        let (info, framebuffer) = unsafe { (&*p_create_info, *p_framebuffer) };
+        // Imageless framebuffers carry no attachment handles to record; the
+        // registry then simply won't resolve passes using them.
+        if !info.flags.contains(vk::FramebufferCreateFlags::IMAGELESS)
+            && (info.attachment_count == 0 || !info.p_attachments.is_null())
+        {
+            // SAFETY: for a non-imageless framebuffer, p_attachments points
+            // at attachment_count views per the Vulkan spec.
+            let attachments = unsafe {
+                std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize)
+            }
+            .to_vec();
+            dispatch::with_device(key, |state| {
+                state
+                    .taps
+                    .lock()
+                    .expect("tap registry poisoned")
+                    .record_framebuffer(
+                        framebuffer,
+                        attachments,
+                        vk::Extent2D {
+                            width: info.width,
+                            height: info.height,
+                        },
+                    );
+            });
+        }
+    }
+    result
+}
+
+/// # Safety
+/// Standard `vkDestroyFramebuffer` contract.
+unsafe extern "system" fn ferridian_destroy_framebuffer(
+    device: vk::Device,
+    framebuffer: vk::Framebuffer,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    // SAFETY: a non-null device passed to a device command is live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    dispatch::with_device(key, |state| {
+        state
+            .taps
+            .lock()
+            .expect("tap registry poisoned")
+            .forget_framebuffer(framebuffer);
+        if let Some(next) = state.destroy_framebuffer {
+            // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+            unsafe { next(device, framebuffer, p_allocator) };
+        }
+    });
+}
+
+/// # Safety
+/// Standard `vkCreateRenderPass` contract.
+unsafe extern "system" fn ferridian_create_render_pass(
+    device: vk::Device,
+    p_create_info: *const vk::RenderPassCreateInfo<'_>,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+    p_render_pass: *mut vk::RenderPass,
+) -> vk::Result {
+    // SAFETY: a non-null device passed to a device command is live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    let Some(Some(next)) = dispatch::with_device(key, |state| state.create_render_pass) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+    let result = unsafe { next(device, p_create_info, p_allocator, p_render_pass) };
+    if result == vk::Result::SUCCESS && !p_create_info.is_null() && !p_render_pass.is_null() {
+        // SAFETY: create info and out-pointer are valid per the contract.
+        let (info, render_pass) = unsafe { (&*p_create_info, *p_render_pass) };
+        if info.attachment_count == 0 || !info.p_attachments.is_null() {
+            // SAFETY: p_attachments points at attachment_count descriptions
+            // per the Vulkan spec.
+            let final_layouts: Vec<vk::ImageLayout> = unsafe {
+                std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize)
+            }
+            .iter()
+            .map(|attachment| attachment.final_layout)
+            .collect();
+            dispatch::with_device(key, |state| {
+                state
+                    .taps
+                    .lock()
+                    .expect("tap registry poisoned")
+                    .record_render_pass(render_pass, final_layouts);
+            });
+        }
+    }
+    result
+}
+
+/// # Safety
+/// Standard `vkDestroyRenderPass` contract.
+unsafe extern "system" fn ferridian_destroy_render_pass(
+    device: vk::Device,
+    render_pass: vk::RenderPass,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    // SAFETY: a non-null device passed to a device command is live.
+    let key = unsafe { dispatch_key(device.as_raw()) };
+    dispatch::with_device(key, |state| {
+        state
+            .taps
+            .lock()
+            .expect("tap registry poisoned")
+            .forget_render_pass(render_pass);
+        if let Some(next) = state.destroy_render_pass {
+            // SAFETY: forwarding the caller's (still valid) arguments down the chain.
+            unsafe { next(device, render_pass, p_allocator) };
+        }
+    });
 }
 
 /// # Safety
@@ -431,6 +665,61 @@ unsafe extern "system" fn ferridian_create_device(
     // SAFETY: the down-chain vkDestroyDevice has exactly this type.
     let destroy_device =
         unsafe { std::mem::transmute::<unsafe extern "system" fn(), PfnDestroyDevice>(destroy) };
+
+    // The *down-chain* device table both compositors record through — calls
+    // on it never re-enter the layer. Missing functions become panicking
+    // stubs we only reach by calling an unsupported command (we stick to
+    // core 1.0).
+    // SAFETY: loading the table for the device that was just created.
+    let device_table = unsafe {
+        ash::Device::load_with(
+            |name| {
+                std::mem::transmute::<vk::PFN_vkVoidFunction, *const c_void>(next_gdpa(
+                    device,
+                    name.as_ptr(),
+                ))
+            },
+            device,
+        )
+    };
+
+    // What PackExecutor needs from the app's device: the queue family the
+    // app renders on (its first requested family — vanilla's graphics
+    // queue), and the physical device's memory types.
+    // SAFETY: for a successful vkCreateDevice, queue_create_info_count ≥ 1
+    // and the array is valid.
+    let queue_family_index = unsafe {
+        let info = &*p_create_info;
+        if info.queue_create_info_count > 0 && !info.p_queue_create_infos.is_null() {
+            (*info.p_queue_create_infos).queue_family_index
+        } else {
+            0
+        }
+    };
+    // SAFETY: queue 0 of a family the app requested exists per the create info.
+    let queue = unsafe { device_table.get_device_queue(queue_family_index, 0) };
+    type PfnGetPhysicalDeviceMemoryProperties =
+        unsafe extern "system" fn(vk::PhysicalDevice, *mut vk::PhysicalDeviceMemoryProperties);
+    // SAFETY: querying a physical-device-level function down-chain and
+    // calling it with the live physical device; the out-struct is plain data.
+    let memory_properties = unsafe {
+        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
+        if let Some(pfn) = next_gipa(instance, c"vkGetPhysicalDeviceMemoryProperties".as_ptr()) {
+            let pfn = std::mem::transmute::<
+                unsafe extern "system" fn(),
+                PfnGetPhysicalDeviceMemoryProperties,
+            >(pfn);
+            pfn(physical_device, &mut properties);
+        }
+        properties
+    };
+    let compositor = hooks::create_compositor(
+        device_table.clone(),
+        queue,
+        queue_family_index,
+        memory_properties,
+    );
+
     dispatch::insert_device(
         key,
         DeviceState {
@@ -446,7 +735,15 @@ unsafe extern "system" fn ferridian_create_device(
                 resolve(c"vkCmdEndDebugUtilsLabelEXT"),
                 PfnCmdEndDebugUtilsLabel
             ),
-            overlay: Mutex::new(Overlay::new(next_gdpa, device)),
+            create_image_view: retype!(resolve(c"vkCreateImageView"), PfnCreateImageView),
+            destroy_image_view: retype!(resolve(c"vkDestroyImageView"), PfnDestroyImageView),
+            create_framebuffer: retype!(resolve(c"vkCreateFramebuffer"), PfnCreateFramebuffer),
+            destroy_framebuffer: retype!(resolve(c"vkDestroyFramebuffer"), PfnDestroyFramebuffer),
+            create_render_pass: retype!(resolve(c"vkCreateRenderPass"), PfnCreateRenderPass),
+            destroy_render_pass: retype!(resolve(c"vkDestroyRenderPass"), PfnDestroyRenderPass),
+            overlay: Mutex::new(Overlay::new(device_table)),
+            taps: Mutex::new(TapRegistry::default()),
+            compositor: Mutex::new(compositor),
         },
     );
     hooks::device_created();
@@ -468,7 +765,7 @@ unsafe extern "system" fn ferridian_destroy_device(
         // Not ours (or already gone) — nothing to forward to.
         return;
     };
-    // The overlay's child objects must die before their device does (VVL
+    // Both compositors' child objects must die before their device does (VVL
     // reports them as leaked at vkDestroyDevice otherwise).
     if let Some(overlay) = state
         .overlay
@@ -477,6 +774,16 @@ unsafe extern "system" fn ferridian_destroy_device(
         .as_mut()
     {
         overlay.destroy();
+    }
+    if let Some(compositor) = state
+        .compositor
+        .lock()
+        .expect("compositor lock poisoned")
+        .as_mut()
+    {
+        // SAFETY: the app must have idled the device per vkDestroyDevice's
+        // rules, so nothing in flight references the compositor's objects.
+        unsafe { compositor.destroy() };
     }
     hooks::device_destroyed();
     // SAFETY: forwarding the destroy down the chain exactly once.

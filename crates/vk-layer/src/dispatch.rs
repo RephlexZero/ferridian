@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, RwLock};
 
 use ash::vk;
+use ferridian_vk_rt::{PackCompositor, TapRegistry};
 
 use crate::overlay::Overlay;
 
@@ -35,6 +36,45 @@ pub(crate) type PfnCmdBeginDebugUtilsLabel =
 
 pub(crate) type PfnCmdEndDebugUtilsLabel = unsafe extern "system" fn(vk::CommandBuffer);
 
+pub(crate) type PfnCreateImageView = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    *const vk::ImageViewCreateInfo<'a>,
+    *const vk::AllocationCallbacks<'a>,
+    *mut vk::ImageView,
+) -> vk::Result;
+
+pub(crate) type PfnDestroyImageView = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    vk::ImageView,
+    *const vk::AllocationCallbacks<'a>,
+);
+
+pub(crate) type PfnCreateFramebuffer = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    *const vk::FramebufferCreateInfo<'a>,
+    *const vk::AllocationCallbacks<'a>,
+    *mut vk::Framebuffer,
+) -> vk::Result;
+
+pub(crate) type PfnDestroyFramebuffer = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    vk::Framebuffer,
+    *const vk::AllocationCallbacks<'a>,
+);
+
+pub(crate) type PfnCreateRenderPass = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    *const vk::RenderPassCreateInfo<'a>,
+    *const vk::AllocationCallbacks<'a>,
+    *mut vk::RenderPass,
+) -> vk::Result;
+
+pub(crate) type PfnDestroyRenderPass = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    vk::RenderPass,
+    *const vk::AllocationCallbacks<'a>,
+);
+
 /// Down-chain state for one live `VkInstance`.
 pub(crate) struct InstanceState {
     pub instance: vk::Instance,
@@ -53,9 +93,21 @@ pub(crate) struct DeviceState {
     pub cmd_end_render_pass: Option<PfnCmdEndRenderPass>,
     pub cmd_begin_debug_utils_label: Option<PfnCmdBeginDebugUtilsLabel>,
     pub cmd_end_debug_utils_label: Option<PfnCmdEndDebugUtilsLabel>,
-    /// The compositor's per-device Vulkan objects; `None` when creation
-    /// failed (compositing then stays off for this device).
+    pub create_image_view: Option<PfnCreateImageView>,
+    pub destroy_image_view: Option<PfnDestroyImageView>,
+    pub create_framebuffer: Option<PfnCreateFramebuffer>,
+    pub destroy_framebuffer: Option<PfnDestroyFramebuffer>,
+    pub create_render_pass: Option<PfnCreateRenderPass>,
+    pub destroy_render_pass: Option<PfnDestroyRenderPass>,
+    /// The overlay's per-device Vulkan objects; `None` when creation
+    /// failed (the embedded overlay then stays off for this device).
     pub overlay: Mutex<Option<Overlay>>,
+    /// The application's live views/framebuffers/render passes, fed from the
+    /// create/destroy hooks so a begun pass can be resolved to attachments.
+    pub taps: Mutex<TapRegistry>,
+    /// Present when `FERRIDIAN_PACK` named a loadable, wireable pack at
+    /// device creation; replaces the embedded overlay when active.
+    pub compositor: Mutex<Option<PackCompositor>>,
 }
 
 static INSTANCES: RwLock<BTreeMap<usize, InstanceState>> = RwLock::new(BTreeMap::new());

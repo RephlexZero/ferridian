@@ -38,8 +38,24 @@ pub struct RenderSpec<'a> {
 
 const READBACK_TIMEOUT_NS: u64 = 10_000_000_000;
 
+/// Format of the optional depth attachment. D32 is universally supported and
+/// has no stencil plane to complicate copies.
+pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+
 /// Render the spec on the runtime's graphics queue and read back the target.
 pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage {
+    render_scene(runtime, spec, false)
+}
+
+/// [`render_offscreen`] with a cleared-to-1.0 [`DEPTH_FORMAT`] attachment the
+/// fragment shader writes via `SV_Depth` — the game-shaped scene (color +
+/// depth) that layer tests tap. The depth image carries `TRANSFER_SRC` so a
+/// compositor can copy it out mid-frame.
+pub fn render_offscreen_with_depth(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage {
+    render_scene(runtime, spec, true)
+}
+
+fn render_scene(runtime: &VkRuntime, spec: &RenderSpec<'_>, with_depth: bool) -> RgbaImage {
     let device = runtime.device();
     let extent = vk::Extent2D {
         width: spec.width,
@@ -93,34 +109,112 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
             .create_image_view(&view_info, None)
             .expect("create render target view");
 
+        // Optional depth attachment — the "game depth" a layer test taps.
+        let depth = with_depth.then(|| {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(DEPTH_FORMAT)
+                .extent(extent.into())
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = device
+                .create_image(&image_info, None)
+                .expect("create depth image");
+            let requirements = device.get_image_memory_requirements(image);
+            let memory = allocate(
+                device,
+                &memory_properties,
+                requirements,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("bind depth memory");
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(DEPTH_FORMAT)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            let view = device
+                .create_image_view(&view_info, None)
+                .expect("create depth view");
+            (image, memory, view)
+        });
+
         // Render pass: clear -> draw -> leave the image ready for transfer.
-        let attachments = [vk::AttachmentDescription::default()
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
+        let mut attachments = vec![
+            vk::AttachmentDescription::default()
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+        ];
+        if with_depth {
+            attachments.push(
+                vk::AttachmentDescription::default()
+                    .format(DEPTH_FORMAT)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    // Stored: whoever taps the frame reads it after the pass.
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+            );
+        }
         let color_refs = [vk::AttachmentReference::default()
             .attachment(0)
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-        let subpasses = [vk::SubpassDescription::default()
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_refs)];
+            .color_attachments(&color_refs);
+        if with_depth {
+            subpass = subpass.depth_stencil_attachment(&depth_ref);
+        }
+        let subpasses = [subpass];
+        let depth_stages = if with_depth {
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+        } else {
+            vk::PipelineStageFlags::empty()
+        };
+        let depth_write = if with_depth {
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+        } else {
+            vk::AccessFlags::empty()
+        };
         let dependencies = [
             vk::SubpassDependency::default()
                 .src_subpass(vk::SUBPASS_EXTERNAL)
                 .dst_subpass(0)
-                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | depth_stages)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | depth_stages)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | depth_write),
             vk::SubpassDependency::default()
                 .src_subpass(0)
                 .dst_subpass(vk::SUBPASS_EXTERNAL)
-                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | depth_stages)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | depth_write)
                 .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
         ];
@@ -132,7 +226,10 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
             .create_render_pass(&render_pass_info, None)
             .expect("create render pass");
 
-        let framebuffer_views = [view];
+        let mut framebuffer_views = vec![view];
+        if let Some((_, _, depth_view)) = &depth {
+            framebuffer_views.push(*depth_view);
+        }
         let framebuffer_info = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass)
             .attachments(&framebuffer_views)
@@ -190,6 +287,12 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        // Fixtures paint depth explicitly (SV_Depth), so the "test" always
+        // passes and every written value lands.
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(with_depth)
+            .depth_write_enable(with_depth)
+            .depth_compare_op(vk::CompareOp::ALWAYS);
         let layout_info = vk::PipelineLayoutCreateInfo::default();
         let pipeline_layout = device
             .create_pipeline_layout(&layout_info, None)
@@ -202,6 +305,7 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
             .color_blend_state(&color_blend)
+            .depth_stencil_state(&depth_stencil)
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
@@ -248,11 +352,19 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
             .begin_command_buffer(command_buffer, &begin_info)
             .expect("begin command buffer");
 
-        let clear_values = [vk::ClearValue {
+        let mut clear_values = vec![vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: spec.clear_color,
             },
         }];
+        if with_depth {
+            clear_values.push(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            });
+        }
         let render_pass_begin = vk::RenderPassBeginInfo::default()
             .render_pass(render_pass)
             .framebuffer(framebuffer)
@@ -348,6 +460,11 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
         device.destroy_shader_module(module, None);
         device.destroy_framebuffer(framebuffer, None);
         device.destroy_render_pass(render_pass, None);
+        if let Some((depth_image, depth_memory, depth_view)) = depth {
+            device.destroy_image_view(depth_view, None);
+            device.destroy_image(depth_image, None);
+            device.free_memory(depth_memory, None);
+        }
         device.destroy_image_view(view, None);
         device.destroy_image(image, None);
         device.free_memory(image_memory, None);

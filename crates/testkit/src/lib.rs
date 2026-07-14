@@ -19,7 +19,9 @@ pub use golden::{
 pub use image::{
     DiffPolicy, ImageDiff, ImageError, RgbaImage, diff_heatmap, diff_images, diff_passes,
 };
-pub use render::{RenderSpec, ShaderSpec, render_offscreen};
+pub use render::{
+    DEPTH_FORMAT, RenderSpec, ShaderSpec, render_offscreen, render_offscreen_with_depth,
+};
 pub use texture::{GpuImage, create_target, read_back, upload_texture};
 
 use ferridian_vk_rt::{RuntimeOptions, VkRuntime};

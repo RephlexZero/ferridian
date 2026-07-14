@@ -18,6 +18,9 @@ workspace = true
 ash = { workspace = true }
 ferridian-contract = { workspace = true }
 ferridian-engine = { workspace = true }
+# The layer stays a shell: pack compositing logic lives in vk-rt
+# (PackCompositor/TapRegistry); the layer only feeds it intercepted events.
+ferridian-vk-rt = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -25,6 +28,5 @@ ferridian-contract = { workspace = true }
 ferridian-engine = { workspace = true }
 ferridian-pack-compiler = { workspace = true }
 ferridian-testkit = { workspace = true }
-ferridian-vk-rt = { workspace = true }
 libloading = { workspace = true }
 serde_json = { workspace = true }
