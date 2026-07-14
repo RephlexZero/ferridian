@@ -87,6 +87,14 @@ impl PassObserver {
     }
 }
 
+/// Whether a classified pass's end is where the layer runs a loaded pack
+/// over the frame. Translucent is the last world-geometry pass in vanilla's
+/// order, so compositing there transforms the finished world while hand and
+/// GUI still draw on top, untouched by pack lighting or fog.
+pub fn composite_trigger(kind: GamePassKind) -> bool {
+    kind == GamePassKind::Translucent
+}
+
 /// A kind's index in [`GamePassKind::ALL`] wire order.
 pub fn kind_index(kind: GamePassKind) -> usize {
     GamePassKind::ALL
@@ -165,6 +173,20 @@ mod tests {
         assert_eq!(observer.render_pass_begun(), GamePassKind::Gui);
         observer.label_ended();
         assert_eq!(observer.render_pass_begun(), GamePassKind::Unknown);
+    }
+
+    #[test]
+    fn composite_triggers_only_after_the_last_world_pass() {
+        let world_final: Vec<_> = GamePassKind::ALL
+            .iter()
+            .copied()
+            .filter(|&kind| composite_trigger(kind))
+            .collect();
+        assert_eq!(world_final, vec![GamePassKind::Translucent]);
+        assert!(
+            !composite_trigger(GamePassKind::Unknown),
+            "unknown passes must never trigger frame processing"
+        );
     }
 
     #[test]
