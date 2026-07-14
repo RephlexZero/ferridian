@@ -72,7 +72,12 @@ plan (intermediate images, descriptor sets, one fullscreen pipeline per pass)
 and replays the schedule writers-before-readers. The four-pass reference pack
 — screen-space shadows → deferred lighting → volumetric fog → composite —
 runs end to end on lavapipe under validation: synthetic game frames in,
-correctly lit and fogged pixels out, deterministic across replays. And the
+correctly lit and fogged pixels out, deterministic across replays. Packs
+now read per-frame state through the contract's `camera` uniform block
+(std140, one field table drives the Rust encoder and the generated Java
+mirror), and the executor owns the buffer — updates are proven live
+on-device, with the placeholder values uploaded until the shim publishes
+real ones. And the
 layer↔executor seam is closed: with a pack artifact armed (`FERRIDIAN_PACK`),
 the layer tracks the app's views/framebuffers/render passes, and at the end
 of the world-final classified pass taps its color+depth attachments, runs
@@ -90,8 +95,9 @@ Follow-ups tracked toward M2+:
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
 - [ ] Layer-side pack hot reload: drive the compositor from `PackWatcher` (executor teardown/rebuild is already invalidation-driven; needs a safe per-frame swap point)
 - [ ] Real-game attachment tapping: intercept `vkCreateImage` to force `TRANSFER_SRC` on attachment usage, and cover `vkCreateRenderPass2`/dynamic rendering (only the classic render-pass path is intercepted today)
-- [ ] Executor v1: compute passes, uniform buffers (contract camera), multiple render targets, gpu-allocator
-- [ ] Reference pack: swap the placeholder camera model for real contract uniforms; golden-image the four passes
+- [ ] Executor v1 (remaining): compute passes, multiple render targets, per-binding sampler filters, gpu-allocator — uniform buffers landed with the contract camera (`CameraUniforms`, std140 on both sides, `update_camera` proven live on-device)
+- [ ] Shim → layer transport for per-frame camera state (the compositor uploads `CameraUniforms::placeholder()` until then)
+- [ ] Reference pack: golden-image the four passes (the placeholder camera *model* is gone — passes read the contract block; the placeholder *values* remain until the shim publishes real state)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
 - [ ] GPU-assisted validation in nightly — verified 2026-07-14 and **blocked**:
