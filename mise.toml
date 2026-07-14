@@ -4,8 +4,8 @@
 # (see ci/mesa.Dockerfile) so dev and CI move in lockstep.
 
 [tools]
-java = "temurin-21"
-gradle = "8"
+java = "temurin-25"
+gradle = "9.6.1"
 lefthook = "1"
 taplo = "0.9"
 typos = "1"
@@ -59,7 +59,7 @@ run = "cargo nextest run -p ferridian-testkit"
 env = { FERRIDIAN_GPU_TESTS = "1", FERRIDIAN_BLESS = "1" }
 
 [tasks.shim-build]
-description = "Build the Fabric shim (needs network for Loom/Minecraft resolution; not part of ci yet)"
+description = "Build the Fabric shim (needs network for Loom/Minecraft resolution; hosted CI runs it in the shim job)"
 run = "gradle -p shim build"
 
 [tasks.deny]

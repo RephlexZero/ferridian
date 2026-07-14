@@ -78,6 +78,29 @@ jobs:
             ferridian-mesa:ci \
             bash -ec 'rustup show >/dev/null; cargo run -p packc -- build packs/reference'
 
+  shim:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # Minecraft 26.x requires Java 25 (see shim/gradle.properties for
+          # the verified version set).
+          java-version: "25"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.6.1"
+      - name: Build the Fabric shim against live Maven
+        run: gradle -p shim build
+      - name: Generated sources are current
+        # The shim is ~90% generated; a contract change without a matching
+        # regenerated shim must fail here, not at game load time.
+        run: |
+          cargo run -p shim-codegen
+          git diff --exit-code shim/src/main/generated
+
   gates:
     needs: lint
     runs-on: ubuntu-latest

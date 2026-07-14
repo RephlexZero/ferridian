@@ -4,7 +4,7 @@
 
 plugins {
     java
-    id("fabric-loom") version (extra["loom_version"] as String)
+    id("net.fabricmc.fabric-loom")
 }
 
 group = "io.ferridian"
@@ -12,7 +12,7 @@ version = "0.1.0"
 
 java {
     toolchain {
-        languageVersion.set(JavaLanguageVersion.of(21))
+        languageVersion.set(JavaLanguageVersion.of(25))
     }
 }
 
@@ -25,13 +25,13 @@ sourceSets {
 }
 
 dependencies {
-    minecraft("com.mojang:minecraft:${extra["minecraft_version"]}")
-    // Minecraft is unobfuscated as of 26.1; official mappings are the identity choice.
-    mappings(loom.officialMojangMappings())
-    modImplementation("net.fabricmc:fabric-loader:${extra["loader_version"]}")
+    minecraft("com.mojang:minecraft:${providers.gradleProperty("minecraft_version").get()}")
+    // Minecraft is unobfuscated as of 26.1: no mappings dependency at all
+    // (Fabric stopped maintaining third-party mappings from 26.1 onward).
+    implementation("net.fabricmc:fabric-loader:${providers.gradleProperty("loader_version").get()}")
 }
 
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
-    options.release.set(21)
+    options.release.set(25)
 }
