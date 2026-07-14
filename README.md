@@ -20,8 +20,8 @@ Dual-licensed MIT or Apache-2.0.
 | `crates/vk-layer` | Vulkan layer cdylib — the interception seam; deliberately boring |
 | `crates/vk-rt` | ash device/queue/alloc runtime, capability tiers |
 | `crates/engine` | pass graph + frame orchestration (no Vulkan init; Miri-able) |
-| `crates/pack-format` | pack manifest schema — pure serde, fuzzed |
-| `crates/pack-compiler` | Slang→SPIR-V compilation + rspirv reflection |
+| `crates/pack-format` | pack manifest schema + SPIR-V reflection — pure, fuzzed |
+| `crates/pack-compiler` | Slang→SPIR-V compilation, artifact writing |
 | `crates/contract` | single source of truth: Java↔Rust ABI + pass metadata |
 | `crates/testkit` | lavapipe bootstrap; **any validation error fails the test** |
 | `tools/packc` | pack-author CLI: build / validate / serve |
@@ -45,7 +45,7 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M2 in-container scope complete; M3 hot reload closed end-to-end
+## Status: M2 in-container scope complete; M3 done — the reference pack executes on device
 
 M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
 blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
@@ -64,15 +64,23 @@ closed end to end: `packc serve` watches, rebuilds, and atomically publishes
 artifact generations; `engine::pack::PackWatcher` consumes them (exactly-once
 per generation, torn-read guarded, artifacts treated as untrusted input),
 proven by a testkit round-trip that puts every reloaded module on a real
-device under validation. The reference pack is now the four-pass M3 shape —
-screen-space shadows → deferred lighting → volumetric fog → composite. The
+device under validation. And loaded packs now **execute**: `engine::exec`
+re-reflects each module and wires descriptors by name (shader binding
+`game_depth` ↔ manifest resource `game_depth` — mismatches are load-time
+errors, not runtime surprises), and `vk-rt`'s `PackExecutor` instantiates the
+plan (intermediate images, descriptor sets, one fullscreen pipeline per pass)
+and replays the schedule writers-before-readers. The four-pass reference pack
+— screen-space shadows → deferred lighting → volumetric fog → composite —
+runs end to end on lavapipe under validation: synthetic game frames in,
+correctly lit and fogged pixels out, deterministic across replays. The
 Fabric shim builds against live Maven (MC 26.2, loader 0.19.3, Loom 1.17.14,
 JDK 25) and CI rejects contract/codegen drift.
 
 Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Execute reloaded packs: descriptor wiring (binding name ↔ resource name) + pass scheduling on device (M4)
+- [ ] Layer↔executor integration: run the executor over the intercepted frame's taps instead of the embedded overlay (M4 seam)
+- [ ] Executor v1: compute passes, uniform buffers (contract camera), multiple render targets, gpu-allocator
 - [ ] Reference pack: swap the placeholder camera model for real contract uniforms; golden-image the four passes
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish

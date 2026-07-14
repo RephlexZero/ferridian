@@ -29,5 +29,19 @@ Rules enforced at build time:
 - Each resource has exactly one writer.
 - The pass graph is acyclic.
 
+Wiring rules, enforced when the engine loads the artifact (it re-reflects
+every module rather than trusting `reflection.toml`):
+
+- Descriptors bind **by name**: declare each input as
+  `[[vk::binding(n, 0)]] Sampler2D <input name>;` — the binding name must
+  match a declared `input` of that pass, and every declared `input` must be
+  bound (an unused input would put false edges in the pass graph).
+- Exactly one pass writes `swapchain`; no pass reads it or writes
+  `game_color`/`game_depth`.
+- Executable today: graphics passes with one output, combined image samplers
+  on set 0, `vs_main`/`fs_main` entry points. Compute passes, uniform
+  buffers, and multiple render targets are load-time errors until the
+  executor grows them.
+
 TODO: resource formats/sizes, settings/options surface, capability
 requirements per pass — designed during M3.
