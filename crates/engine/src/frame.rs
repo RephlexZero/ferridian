@@ -142,15 +142,23 @@ mod tests {
 
     #[test]
     fn hostile_label_depth_stays_bounded_and_balanced() {
+        // Anything past MAX_LABEL_DEPTH only exercises the saturating counter,
+        // so Miri's interpreter gets a flood that is deep enough to prove the
+        // bound without spending an hour on identical iterations.
+        let flood = if cfg!(miri) {
+            MAX_LABEL_DEPTH + 100
+        } else {
+            1_000_000
+        };
         let mut observer = observer();
         observer.label_begun(&anchor(GamePassKind::Gui));
-        for i in 0..1_000_000 {
+        for i in 0..flood {
             observer.label_begun(&format!("flood {i}"));
         }
         assert!(observer.label_stack.len() <= MAX_LABEL_DEPTH);
         // The GUI label is still the innermost *matching* one…
         assert_eq!(observer.render_pass_begun(), GamePassKind::Gui);
-        for _ in 0..1_000_000 {
+        for _ in 0..flood {
             observer.label_ended();
         }
         // …and exactly balancing the flood leaves it open.
