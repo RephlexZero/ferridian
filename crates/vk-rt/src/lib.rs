@@ -3,8 +3,10 @@
 //! talks in terms of the runtime's types.
 
 mod capability;
+pub mod exec;
 
 pub use capability::{CapabilityTier, DeviceProfile, capability_tier};
+pub use exec::{ExecContext, ExecError, OutputTarget, PackExecutor};
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex};
@@ -235,6 +237,26 @@ impl VkRuntime {
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
+        // SAFETY: the physical device was enumerated from this instance.
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        }
+    }
+
+    /// This runtime's device-side handles, in the form [`exec::PackExecutor`]
+    /// consumes (inside the layer the same struct is built from the
+    /// intercepted application's device instead).
+    pub fn exec_context(&self) -> ExecContext<'_> {
+        ExecContext {
+            device: &self.device,
+            queue: self.queue,
+            queue_family_index: self.queue_family_index,
+            memory_properties: self.memory_properties(),
+        }
     }
 
     /// Messages collected from the validation layer so far (errors + warnings).

@@ -291,6 +291,7 @@ dependencies = [
 name = "ferridian-pack-format"
 version = "0.1.0"
 dependencies = [
+ "rspirv",
  "serde",
  "thiserror 2.0.18",
  "toml",
@@ -329,6 +330,7 @@ name = "ferridian-vk-rt"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ferridian-engine",
  "gpu-allocator",
  "thiserror 2.0.18",
  "tracing",

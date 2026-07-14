@@ -359,7 +359,7 @@ pub fn render_offscreen(runtime: &VkRuntime, spec: &RenderSpec<'_>) -> RgbaImage
 /// Allocate memory for `requirements`, preferring `wanted` properties but
 /// falling back to any compatible type (lavapipe advertises everything as
 /// host-visible anyway).
-unsafe fn allocate(
+pub(crate) unsafe fn allocate(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     requirements: vk::MemoryRequirements,

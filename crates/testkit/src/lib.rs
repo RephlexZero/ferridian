@@ -11,6 +11,7 @@
 mod golden;
 mod image;
 mod render;
+mod texture;
 
 pub use golden::{
     assert_matches_golden, assert_matches_golden_with, bless_enabled, failures_dir, goldens_dir,
@@ -19,6 +20,7 @@ pub use image::{
     DiffPolicy, ImageDiff, ImageError, RgbaImage, diff_heatmap, diff_images, diff_passes,
 };
 pub use render::{RenderSpec, ShaderSpec, render_offscreen};
+pub use texture::{GpuImage, create_target, read_back, upload_texture};
 
 use ferridian_vk_rt::{RuntimeOptions, VkRuntime};
 
