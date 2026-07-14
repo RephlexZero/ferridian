@@ -3,10 +3,14 @@
 //! talks in terms of the runtime's types.
 
 mod capability;
+pub mod compositor;
 pub mod exec;
+pub mod tap;
 
 pub use capability::{CapabilityTier, DeviceProfile, capability_tier};
+pub use compositor::{CompositorError, PackCompositor};
 pub use exec::{ExecContext, ExecError, OutputTarget, PackExecutor};
+pub use tap::{ResolvedAttachment, ResolvedFrame, TapRegistry, ViewRecord};
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex};

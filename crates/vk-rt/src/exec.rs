@@ -64,7 +64,7 @@ pub enum ExecError {
     BadEntryPointName(String),
 }
 
-fn vk_err(what: &'static str) -> impl FnOnce(vk::Result) -> ExecError {
+pub(crate) fn vk_err(what: &'static str) -> impl FnOnce(vk::Result) -> ExecError {
     move |result| ExecError::Vk { what, result }
 }
 
@@ -142,9 +142,14 @@ impl PackExecutor {
     ) -> Result<(), ExecError> {
         let device = ctx.device;
 
+        // NEAREST, not LINEAR: every sampled resource is a same-extent tap or
+        // intermediate read at texel centers, where the two are identical —
+        // and depth-format taps are legal to sample NEAREST everywhere, while
+        // linear filtering of depth is an optional format feature. Per-binding
+        // filter configuration arrives with executor v1.
         let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
@@ -619,7 +624,7 @@ impl PackExecutor {
 
 /// Dedicated device-local allocation with fallback to any compatible type
 /// (lavapipe advertises everything host-visible).
-fn allocate(
+pub(crate) fn allocate(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     requirements: vk::MemoryRequirements,
