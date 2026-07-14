@@ -5,6 +5,7 @@
 //! reach as much of the engine as physics allows. Device work lives in
 //! `ferridian-vk-rt`; interception lives in `ferridian-vk-layer`.
 
+pub mod exec;
 pub mod frame;
 pub mod pack;
 
