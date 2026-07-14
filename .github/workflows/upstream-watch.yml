@@ -1,9 +1,14 @@
 # Upstream breakage detection (§5): poll Mojang's version manifest every 6 h.
-# Exit 3 from `upstream-watch poll` means unseen versions exist.
+# Exit 3 from `upstream-watch poll`/`diff` means "changes found, act on it".
+#
+# On a new version this job downloads its (unobfuscated) client jar, derives
+# the signature inventory of tracked render classes straight from the
+# classfiles, and diffs it against the committed inventory — the report lands
+# on the tracking issue.
 #
 # LEGAL GUARDRAIL: only *derived* signature inventories (names/signatures/
-# hashes) may ever be committed or attached to issues. Decompiled Mojang
-# source stays inside the CI job and is discarded with the runner.
+# hashes) may ever be committed or attached to issues. The jar and its
+# contents stay inside the CI job and are discarded with the runner.
 
 name: upstream-watch
 
@@ -32,7 +37,39 @@ jobs:
           set -e
           echo "exit=$code" >> "$GITHUB_OUTPUT"
           if [ "$code" != 0 ] && [ "$code" != 3 ]; then exit "$code"; fi
-      - name: Open tracking issue for new versions
+      - name: Extract + diff signature inventory of the newest version
+        id: inventory
+        if: steps.poll.outputs.exit == '3'
+        run: |
+          newest=$(head -1 poll.txt | sed 's/^new [a-z_]*: //')
+          echo "version=$newest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Signature inventory: $newest vs committed baseline"
+            echo
+            set +e
+            cargo run -q -p upstream-watch -- fetch-jar "$newest" --out /tmp/client.jar \
+              && cargo run -q -p upstream-watch -- extract /tmp/client.jar --out /tmp/inventory-new.toml
+            if [ $? != 0 ]; then
+              echo '(fetch/extract failed — see the workflow run log)'
+            else
+              echo '```'
+              cargo run -q -p upstream-watch -- diff \
+                tools/upstream-watch/data/inventory.toml /tmp/inventory-new.toml
+              diff_code=$?
+              echo '```'
+              if [ "$diff_code" = 3 ]; then
+                echo
+                echo "Tracked render signatures **changed** — regenerate the shim contract" \
+                     "and re-run goldens before adopting $newest."
+              elif [ "$diff_code" = 0 ]; then
+                echo
+                echo "No tracked signature changes — likely a safe version bump. ✅"
+              fi
+            fi
+            set -e
+          } > report.md
+          cat report.md
+      - name: Open or update tracking issue
         if: steps.poll.outputs.exit == '3'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,17 +77,15 @@ jobs:
           title="upstream: new Minecraft version(s) detected"
           body="$(cat poll.txt)
 
-          Next steps (M1 automation will do this itself):
-          1. Download the (unobfuscated) client jar in CI.
-          2. Decompile with Vineflower **in CI only** — never commit output.
-          3. Extract the derived signature inventory of tracked render classes.
-          4. \`upstream-watch diff\` against the committed inventory.
-          5. Regenerate the shim contract if signatures moved."
+          $(cat report.md)
+
+          To adopt: update \`tools/upstream-watch/data/inventory.toml\` (run
+          \`fetch-jar\` + \`extract\` locally or lift it from this run), append the
+          version to \`known_versions.toml\`, regenerate the shim if signatures
+          moved, and let the golden job judge the result."
           existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
           else
             gh issue create --title "$title" --body "$body"
           fi
-        # TODO(M1): decompile + inventory extraction + shim-regen PR draft,
-        # gated on goldens passing under the new jar.

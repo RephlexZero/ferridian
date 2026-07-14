@@ -1,0 +1,38 @@
+# Render classes whose signatures upstream-watch tracks across Minecraft
+# versions (26.2 baseline). Chosen for where Ferridian touches the game:
+#
+# - blaze3d.vulkan.*  — the experimental Vulkan backend our layer intercepts
+# - blaze3d.systems.* — the GPU abstraction the renderer drives (pass shapes)
+# - client.renderer.* — pass semantics the shim publishes over the contract
+#
+# A signature change here = a probable break in pass detection or the shim;
+# the 6-hourly workflow diffs this inventory and opens an issue with the
+# report. Only *derived* signatures are ever committed (legal guardrail).
+#
+# Known upcoming churn: 26.3 snapshots move the GPU stack to
+# com.mojang.renderpearl (blaze3d.vulkan -> renderpearl.backend.vulkan);
+# retarget this list + inventory.toml when we adopt a 26.3 baseline.
+
+classes = [
+  # Vulkan backend seam
+  "com.mojang.blaze3d.vulkan.VulkanBackend",
+  "com.mojang.blaze3d.vulkan.VulkanInstance",
+  "com.mojang.blaze3d.vulkan.VulkanDevice",
+  "com.mojang.blaze3d.vulkan.VulkanQueue",
+  "com.mojang.blaze3d.vulkan.VulkanCommandEncoder",
+  "com.mojang.blaze3d.vulkan.VulkanRenderPass",
+  "com.mojang.blaze3d.vulkan.VulkanRenderPipeline",
+  "com.mojang.blaze3d.vulkan.VulkanGpuSurface",
+  # GPU abstraction the game renders through
+  "com.mojang.blaze3d.systems.RenderSystem",
+  "com.mojang.blaze3d.systems.RenderPass",
+  "com.mojang.blaze3d.systems.RenderPassDescriptor",
+  "com.mojang.blaze3d.systems.GpuDevice",
+  "com.mojang.blaze3d.systems.GpuSurface",
+  # Pass semantics (shim anchors)
+  "net.minecraft.client.renderer.LevelRenderer",
+  "net.minecraft.client.renderer.GameRenderer",
+  "net.minecraft.client.renderer.LevelTargetBundle",
+  "net.minecraft.client.renderer.PostChain",
+  "net.minecraft.client.renderer.ShaderManager",
+]

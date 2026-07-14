@@ -6,6 +6,9 @@
 //! are ever committed; decompiled Mojang source never enters the repo
 //! (legal guardrail, enforced by review + CI discipline).
 
+pub mod classfile;
+pub mod extract;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +38,27 @@ pub struct VersionEntry {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
+    /// Per-version metadata JSON (jar download URLs live behind it).
+    pub url: String,
+}
+
+/// The subset of a per-version metadata document we care about.
+#[derive(Debug, Deserialize)]
+pub struct VersionDetail {
+    pub downloads: VersionDownloads,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VersionDownloads {
+    /// The client jar — unobfuscated as of 26.1.
+    pub client: DownloadEntry,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DownloadEntry {
+    pub url: String,
+    pub sha1: String,
+    pub size: u64,
 }
 
 /// Versions we've already processed, committed to the repo.
@@ -162,10 +186,12 @@ mod tests {
                 VersionEntry {
                     id: "26.3-pre1".to_owned(),
                     kind: "snapshot".to_owned(),
+                    url: "https://example.invalid/26.3-pre1.json".to_owned(),
                 },
                 VersionEntry {
                     id: "26.2".to_owned(),
                     kind: "release".to_owned(),
+                    url: "https://example.invalid/26.2.json".to_owned(),
                 },
             ],
         };
