@@ -2,6 +2,7 @@
 // fog's inscattered light, through a placeholder Reinhard tonemap. Real
 // grading (exposure, purkinje, LUTs) arrives with the showcase.
 
+#include "fullscreen.slang"
 #include "common.slang"
 
 [[vk::binding(0, 0)]]

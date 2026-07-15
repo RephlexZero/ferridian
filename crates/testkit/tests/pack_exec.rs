@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ash::vk;
-use ferridian_engine::exec::plan_execution;
+use ferridian_engine::exec::{StagePlan, plan_execution};
 use ferridian_engine::pack::load_pack;
 use ferridian_pack_compiler::{SlangCompiler, compile_pack, write_artifact};
 use ferridian_testkit::{
@@ -118,6 +118,16 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
             ("composite", None),
         ]
     );
+    // Volumetric is the pack's first compute pass: dispatched over the
+    // frame, writing `fog` as a storage image instead of an attachment.
+    assert_eq!(
+        plan.passes[2].stage,
+        StagePlan::Compute {
+            entry: "cs_main".to_owned(),
+            workgroup_size: [8, 8, 1],
+        }
+    );
+    assert_eq!(plan.passes[2].output_binding, Some(2));
 
     let mut gpu = TestGpu::new();
     let runtime = gpu.runtime();

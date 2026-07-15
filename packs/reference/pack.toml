@@ -28,7 +28,7 @@ outputs = ["lit"]
 
 [[pass]]
 name = "volumetric"
-kind = "graphics"
+kind = "compute"
 shader = "shaders/volumetric.slang"
 inputs = ["game_depth", "shadow_mask"]
 outputs = ["fog"]

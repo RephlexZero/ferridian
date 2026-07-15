@@ -3,6 +3,7 @@
 // then relight with a sun + ambient split modulated by the shadows pass.
 // A true material G-buffer arrives with the layer's render-target taps.
 
+#include "fullscreen.slang"
 #include "common.slang"
 
 [[vk::binding(0, 0)]]

@@ -3,6 +3,7 @@
 // term the deferred and volumetric passes consume; real cascaded shadow maps
 // arrive once the layer taps the game's own shadow pass.
 
+#include "fullscreen.slang"
 #include "common.slang"
 
 [[vk::binding(0, 0)]]

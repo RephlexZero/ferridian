@@ -1,26 +1,10 @@
-// Shared scaffolding for every reference-pack pass: the fullscreen-triangle
-// vertex stage and the placeholder camera model.
+// Shared scaffolding for every reference-pack pass: the contract camera
+// block and depth helpers. The fullscreen-triangle vertex stage lives in
+// fullscreen.slang, included by graphics passes only — compute passes
+// include this file alone so their module carries a single entry point.
 //
 // Included (not imported) so each pass module stays self-contained — packc
-// compiles one module per pass, and every graphics module carries its own
-// vertex stage.
-
-struct VsOut
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-[shader("vertex")]
-VsOut vs_main(uint vertexId: SV_VertexID)
-{
-    // Fullscreen triangle from the vertex id; no vertex buffer needed.
-    VsOut output;
-    float2 uv = float2((vertexId << 1) & 2, vertexId & 2);
-    output.position = float4(uv * 2.0 - 1.0, 0.0, 1.0);
-    output.uv = uv;
-    return output;
-}
+// compiles one module per pass.
 
 // The contract camera block (ferridian_contract::CameraUniforms, std140):
 // member names, order, and offsets are the contract, and the engine wires
