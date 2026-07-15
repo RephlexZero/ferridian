@@ -12,6 +12,8 @@ pub mod reflection;
 
 pub use reflection::{BindingReflection, EntryPointReflection, ShaderReflection, reflect_spirv};
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Resources the engine provides to every pack; passes may read these without
@@ -62,6 +64,18 @@ pub enum PassKind {
     Compute,
 }
 
+/// How a pass's sampled input is filtered. Nearest is the default: every
+/// same-extent read at texel centers is filter-invariant, and nearest is the
+/// only mode universally legal on depth formats (linear filtering of depth
+/// is an optional format feature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Filter {
+    #[default]
+    Nearest,
+    Linear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassDecl {
@@ -73,6 +87,11 @@ pub struct PassDecl {
     pub inputs: Vec<String>,
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// Sampler filter per input (`filters = { game_color = "linear" }`);
+    /// unlisted inputs get [`Filter::Nearest`]. Keys must name declared
+    /// inputs of this pass.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub filters: BTreeMap<String, Filter>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -91,6 +110,8 @@ pub enum ManifestError {
         "invalid pass name {0:?}: pass names become artifact file names, only [A-Za-z0-9_-] is allowed"
     )]
     InvalidPassName(String),
+    #[error("pass {pass} sets a filter for {input:?}, which is not one of its inputs")]
+    FilterWithoutInput { pass: String, input: String },
 }
 
 impl PackManifest {
@@ -142,6 +163,14 @@ impl PackManifest {
                     return Err(ManifestError::UnknownInput {
                         pass: pass.name.clone(),
                         input: input.clone(),
+                    });
+                }
+            }
+            for filtered in pass.filters.keys() {
+                if !pass.inputs.contains(filtered) {
+                    return Err(ManifestError::FilterWithoutInput {
+                        pass: pass.name.clone(),
+                        input: filtered.clone(),
                     });
                 }
             }
@@ -218,6 +247,34 @@ mod tests {
                 "pass name {hostile:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn parses_filters_and_rejects_ones_naming_no_input() {
+        let filtered = MINIMAL.replace(
+            "inputs = [\"game_color\"]",
+            "inputs = [\"game_color\"]\nfilters = { game_color = \"linear\" }",
+        );
+        let manifest = PackManifest::from_toml_str(&filtered).unwrap();
+        assert_eq!(
+            manifest.passes[0].filters.get("game_color"),
+            Some(&Filter::Linear)
+        );
+        // Round-trips through serialization like every other field.
+        let text = manifest.to_toml_string();
+        assert_eq!(PackManifest::from_toml_str(&text).unwrap(), manifest);
+
+        let dangling = MINIMAL.replace(
+            "inputs = [\"game_color\"]",
+            "inputs = [\"game_color\"]\nfilters = { game_depth = \"nearest\" }",
+        );
+        assert_eq!(
+            PackManifest::from_toml_str(&dangling),
+            Err(ManifestError::FilterWithoutInput {
+                pass: "composite".to_owned(),
+                input: "game_depth".to_owned(),
+            })
+        );
     }
 
     #[test]
