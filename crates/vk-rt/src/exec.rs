@@ -3,10 +3,13 @@
 //!
 //! [`PackExecutor::new`] creates everything a wired plan needs — one
 //! RGBA16F image per intermediate resource, a descriptor set per pass wired
-//! binding-slot → resource view, and one fullscreen-triangle pipeline per
-//! pass — and [`PackExecutor::record`] replays the schedule into a command
-//! buffer, writers before readers, with the write→sample transition carried
-//! by each render pass's final layout and an external subpass dependency.
+//! binding-slot → resource view, and one pipeline per pass (a
+//! fullscreen-triangle graphics pipeline, or a compute pipeline dispatched
+//! over the frame) — and [`PackExecutor::record`] replays the schedule into
+//! a command buffer, writers before readers. Graphics writes become sampleable
+//! through each render pass's final layout and an external subpass
+//! dependency; compute writes go through explicit `GENERAL` ↔
+//! `SHADER_READ_ONLY` image barriers around each dispatch.
 //!
 //! This is runtime code (it will run inside someone's game), so nothing here
 //! panics: every Vulkan failure is an [`ExecError`], and a half-built
@@ -19,7 +22,7 @@ use std::ffi::CString;
 
 use ash::vk;
 use ferridian_contract::CameraUniforms;
-use ferridian_engine::exec::{ExecutionPlan, PassPlan, SWAPCHAIN};
+use ferridian_engine::exec::{ExecutionPlan, PassPlan, SWAPCHAIN, StagePlan};
 
 /// Format of every executor-created intermediate resource. Float, because
 /// passes exchange scene-referred values (the reference pack's `lit`/`fog`
@@ -87,7 +90,17 @@ struct Intermediate {
     view: vk::ImageView,
 }
 
+/// A compute pass's dispatch parameters: how many groups cover the frame,
+/// and the written image [`PackExecutor::record`] must barrier between
+/// `GENERAL` (dispatch) and `SHADER_READ_ONLY_OPTIMAL` (consumers).
+struct ComputeDispatch {
+    group_counts: [u32; 3],
+    output_image: vk::Image,
+}
+
 /// Per-pass device objects, in the order [`PackExecutor::record`] replays.
+/// `render_pass`/`framebuffer` stay null for compute passes; `compute` is
+/// `None` for graphics passes.
 struct PassResources {
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
@@ -97,6 +110,7 @@ struct PassResources {
     pipeline: vk::Pipeline,
     /// Freed with the pool.
     descriptor_set: vk::DescriptorSet,
+    compute: Option<ComputeDispatch>,
 }
 
 /// A plan instantiated on a device, reusable across frames until destroyed.
@@ -176,7 +190,22 @@ impl PackExecutor {
         self.sampler = unsafe { device.create_sampler(&sampler_info, None) }
             .map_err(vk_err("create sampler"))?;
 
+        // How an intermediate is written decides its usage: compute outputs
+        // are storage images, graphics outputs are color attachments (the
+        // graph guarantees exactly one writer). RGBA16F supports both
+        // everywhere — storage on it is in Vulkan's required-format table.
+        let compute_written: Vec<&str> = plan
+            .passes
+            .iter()
+            .filter(|pass| matches!(pass.stage, StagePlan::Compute { .. }))
+            .map(|pass| pass.output.0.as_str())
+            .collect();
         for resource in &plan.intermediates {
+            let write_usage = if compute_written.contains(&resource.0.as_str()) {
+                vk::ImageUsageFlags::STORAGE
+            } else {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+            };
             let image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(INTERMEDIATE_FORMAT)
@@ -185,7 +214,7 @@ impl PackExecutor {
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                .usage(write_usage | vk::ImageUsageFlags::SAMPLED)
                 .initial_layout(vk::ImageLayout::UNDEFINED);
             // The slot is pushed first with null handles and filled as each
             // create succeeds, so a mid-loop failure leaves nothing destroy()
@@ -241,6 +270,12 @@ impl PackExecutor {
         for (name, &view) in external_inputs {
             views.insert(name.clone(), view);
         }
+        // Resource name -> image, for compute passes' dispatch barriers.
+        let images: BTreeMap<String, vk::Image> = self
+            .intermediates
+            .iter()
+            .map(|i| (i.name.clone(), i.image))
+            .collect();
 
         // One camera buffer serves every pass that binds the block.
         let camera_bindings: u32 = plan
@@ -302,6 +337,19 @@ impl PackExecutor {
                     .descriptor_count(camera_bindings),
             );
         }
+        // One storage-image descriptor per compute pass (its output).
+        let storage_bindings: u32 = plan
+            .passes
+            .iter()
+            .filter(|pass| pass.output_binding.is_some())
+            .count() as u32;
+        if storage_bindings > 0 {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(storage_bindings),
+            );
+        }
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(plan.passes.len().max(1) as u32)
             .pool_sizes(&pool_sizes);
@@ -310,7 +358,7 @@ impl PackExecutor {
             .map_err(vk_err("create descriptor pool"))?;
 
         for pass in &plan.passes {
-            let resources = self.build_pass(ctx, pass, modules, &views, output)?;
+            let resources = self.build_pass(ctx, pass, modules, &views, &images, output)?;
             self.passes.push(resources);
         }
 
@@ -331,6 +379,7 @@ impl PackExecutor {
         pass: &PassPlan,
         modules: &BTreeMap<String, Vec<u32>>,
         views: &BTreeMap<String, vk::ImageView>,
+        images: &BTreeMap<String, vk::Image>,
         output: &OutputTarget,
     ) -> Result<PassResources, ExecError> {
         let device = ctx.device;
@@ -347,6 +396,10 @@ impl PackExecutor {
                 .ok_or_else(|| ExecError::MissingExternalInput(pass.output.0.clone()))?;
             (view, INTERMEDIATE_FORMAT)
         };
+        let shader_stages = match pass.stage {
+            StagePlan::Graphics { .. } => vk::ShaderStageFlags::FRAGMENT,
+            StagePlan::Compute { .. } => vk::ShaderStageFlags::COMPUTE,
+        };
 
         let mut resources = PassResources {
             set_layout: vk::DescriptorSetLayout::null(),
@@ -356,6 +409,7 @@ impl PackExecutor {
             module: vk::ShaderModule::null(),
             pipeline: vk::Pipeline::null(),
             descriptor_set: vk::DescriptorSet::null(),
+            compute: None,
         };
         // On failure, hand the partial resources to `self` so destroy()
         // reaches them; a closure-based try block keeps that in one place.
@@ -368,18 +422,33 @@ impl PackExecutor {
                         .binding(binding.binding)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                        .stage_flags(shader_stages)
                 })
                 .collect();
             if let Some(slot) = pass.camera_binding {
+                let camera_stages = match pass.stage {
+                    // Fragment-only today, but vertex access is free to
+                    // declare and packs will want it.
+                    StagePlan::Graphics { .. } => {
+                        vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX
+                    }
+                    StagePlan::Compute { .. } => vk::ShaderStageFlags::COMPUTE,
+                };
                 layout_bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(slot)
                         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                         .descriptor_count(1)
-                        // Fragment-only today, but vertex access is free to
-                        // declare and packs will want it.
-                        .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
+                        .stage_flags(camera_stages),
+                );
+            }
+            if let Some(slot) = pass.output_binding {
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(slot)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
             }
             let set_layout_info =
@@ -399,74 +468,6 @@ impl PackExecutor {
                     .create_pipeline_layout(&pipeline_layout_info, None)
                     .map_err(vk_err("create pipeline layout"))?;
 
-                // Written by exactly one pass (graph-guaranteed), then only
-                // sampled — the render pass carries the transition, the exit
-                // dependency makes the write visible to consumers.
-                let final_layout = if writes_swapchain {
-                    output.final_layout
-                } else {
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                };
-                let (exit_stage, exit_access) = if writes_swapchain {
-                    (
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                    )
-                } else {
-                    (
-                        vk::PipelineStageFlags::FRAGMENT_SHADER,
-                        vk::AccessFlags::SHADER_READ,
-                    )
-                };
-                let attachments = [vk::AttachmentDescription::default()
-                    .format(target_format)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(final_layout)];
-                let color_refs = [vk::AttachmentReference::default()
-                    .attachment(0)
-                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-                let subpasses = [vk::SubpassDescription::default()
-                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(&color_refs)];
-                let dependencies = [
-                    vk::SubpassDependency::default()
-                        .src_subpass(vk::SUBPASS_EXTERNAL)
-                        .dst_subpass(0)
-                        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                    vk::SubpassDependency::default()
-                        .src_subpass(0)
-                        .dst_subpass(vk::SUBPASS_EXTERNAL)
-                        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                        .dst_stage_mask(exit_stage)
-                        .dst_access_mask(exit_access),
-                ];
-                let render_pass_info = vk::RenderPassCreateInfo::default()
-                    .attachments(&attachments)
-                    .subpasses(&subpasses)
-                    .dependencies(&dependencies);
-                resources.render_pass = device
-                    .create_render_pass(&render_pass_info, None)
-                    .map_err(vk_err("create render pass"))?;
-
-                let framebuffer_views = [target_view];
-                let framebuffer_info = vk::FramebufferCreateInfo::default()
-                    .render_pass(resources.render_pass)
-                    .attachments(&framebuffer_views)
-                    .width(self.extent.width)
-                    .height(self.extent.height)
-                    .layers(1);
-                resources.framebuffer = device
-                    .create_framebuffer(&framebuffer_info, None)
-                    .map_err(vk_err("create framebuffer"))?;
-
                 let words = modules
                     .get(&pass.name)
                     .ok_or_else(|| ExecError::MissingModule(pass.name.clone()))?;
@@ -475,63 +476,59 @@ impl PackExecutor {
                     .create_shader_module(&module_info, None)
                     .map_err(vk_err("create shader module"))?;
 
-                let vertex_entry = CString::new(pass.vertex_entry.as_str())
-                    .map_err(|_| ExecError::BadEntryPointName(pass.vertex_entry.clone()))?;
-                let fragment_entry = CString::new(pass.fragment_entry.as_str())
-                    .map_err(|_| ExecError::BadEntryPointName(pass.fragment_entry.clone()))?;
-                let stages = [
-                    vk::PipelineShaderStageCreateInfo::default()
-                        .stage(vk::ShaderStageFlags::VERTEX)
-                        .module(resources.module)
-                        .name(&vertex_entry),
-                    vk::PipelineShaderStageCreateInfo::default()
-                        .stage(vk::ShaderStageFlags::FRAGMENT)
-                        .module(resources.module)
-                        .name(&fragment_entry),
-                ];
-                let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-                let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-                let viewports = [vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: self.extent.width as f32,
-                    height: self.extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }];
-                let scissors = [vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.extent,
-                }];
-                let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-                    .viewports(&viewports)
-                    .scissors(&scissors);
-                let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-                    .polygon_mode(vk::PolygonMode::FILL)
-                    .cull_mode(vk::CullModeFlags::NONE)
-                    .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                    .line_width(1.0);
-                let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-                    .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-                let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::RGBA)];
-                let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-                    .attachments(&blend_attachments);
-                let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-                    .stages(&stages)
-                    .vertex_input_state(&vertex_input)
-                    .input_assembly_state(&input_assembly)
-                    .viewport_state(&viewport_state)
-                    .rasterization_state(&rasterization)
-                    .multisample_state(&multisample)
-                    .color_blend_state(&color_blend)
-                    .layout(resources.pipeline_layout)
-                    .render_pass(resources.render_pass)
-                    .subpass(0);
-                resources.pipeline = device
-                    .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-                    .map_err(|(_, result)| vk_err("create graphics pipeline")(result))?[0];
+                match &pass.stage {
+                    StagePlan::Graphics {
+                        vertex_entry,
+                        fragment_entry,
+                    } => self.build_graphics_pipeline(
+                        device,
+                        &mut resources,
+                        vertex_entry,
+                        fragment_entry,
+                        target_view,
+                        target_format,
+                        writes_swapchain,
+                        output,
+                    )?,
+                    StagePlan::Compute {
+                        entry,
+                        workgroup_size,
+                    } => {
+                        let entry_name = CString::new(entry.as_str())
+                            .map_err(|_| ExecError::BadEntryPointName(entry.clone()))?;
+                        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(resources.module)
+                            .name(&entry_name);
+                        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+                            .stage(stage_info)
+                            .layout(resources.pipeline_layout);
+                        resources.pipeline = device
+                            .create_compute_pipelines(
+                                vk::PipelineCache::null(),
+                                &[pipeline_info],
+                                None,
+                            )
+                            .map_err(|(_, result)| vk_err("create compute pipeline")(result))?[0];
+                        let output_image = images
+                            .get(pass.output.0.as_str())
+                            .copied()
+                            // Unreachable as for target_view above: compute
+                            // outputs are always intermediates (the planner
+                            // rejects compute→swapchain).
+                            .ok_or_else(|| {
+                                ExecError::MissingExternalInput(pass.output.0.clone())
+                            })?;
+                        resources.compute = Some(ComputeDispatch {
+                            group_counts: [
+                                self.extent.width.div_ceil(workgroup_size[0].max(1)),
+                                self.extent.height.div_ceil(workgroup_size[1].max(1)),
+                                1,
+                            ],
+                            output_image,
+                        });
+                    }
+                }
 
                 let set_layouts = [resources.set_layout];
                 let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -590,6 +587,28 @@ impl PackExecutor {
                             .buffer_info(info),
                     );
                 }
+                // The compute output: written in GENERAL (record() puts the
+                // image there before the dispatch).
+                let output_info = pass
+                    .output_binding
+                    .map(|_| {
+                        let view = views.get(pass.output.0.as_str()).copied().ok_or_else(|| {
+                            ExecError::MissingExternalInput(pass.output.0.clone())
+                        })?;
+                        Ok::<_, ExecError>([vk::DescriptorImageInfo::default()
+                            .image_view(view)
+                            .image_layout(vk::ImageLayout::GENERAL)])
+                    })
+                    .transpose()?;
+                if let (Some(slot), Some(info)) = (pass.output_binding, output_info.as_ref()) {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(resources.descriptor_set)
+                            .dst_binding(slot)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(info),
+                    );
+                }
                 device.update_descriptor_sets(&writes, &[]);
             }
             Ok(())
@@ -601,6 +620,158 @@ impl PackExecutor {
                 Err(error)
             }
         }
+    }
+
+    /// The graphics half of [`PackExecutor::build_pass`]: render pass,
+    /// framebuffer, and the fullscreen-triangle pipeline. `resources.module`
+    /// and `resources.pipeline_layout` must already be created.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private continuation of build_pass, not an API"
+    )]
+    fn build_graphics_pipeline(
+        &self,
+        device: &ash::Device,
+        resources: &mut PassResources,
+        vertex_entry: &str,
+        fragment_entry: &str,
+        target_view: vk::ImageView,
+        target_format: vk::Format,
+        writes_swapchain: bool,
+        output: &OutputTarget,
+    ) -> Result<(), ExecError> {
+        // Written by exactly one pass (graph-guaranteed), then only
+        // sampled — the render pass carries the transition, the exit
+        // dependency makes the write visible to consumers.
+        let final_layout = if writes_swapchain {
+            output.final_layout
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        };
+        let (exit_stage, exit_access) = if writes_swapchain {
+            (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            )
+        } else {
+            (
+                // The consuming pass may sample from a fragment shader or a
+                // compute dispatch.
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )
+        };
+        // SAFETY: as in build_pass — create infos borrow locals that outlive
+        // each call; every handle lands in `resources`.
+        unsafe {
+            let attachments = [vk::AttachmentDescription::default()
+                .format(target_format)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(final_layout)];
+            let color_refs = [vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let subpasses = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_refs)];
+            let dependencies = [
+                vk::SubpassDependency::default()
+                    .src_subpass(vk::SUBPASS_EXTERNAL)
+                    .dst_subpass(0)
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                vk::SubpassDependency::default()
+                    .src_subpass(0)
+                    .dst_subpass(vk::SUBPASS_EXTERNAL)
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(exit_stage)
+                    .dst_access_mask(exit_access),
+            ];
+            let render_pass_info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments)
+                .subpasses(&subpasses)
+                .dependencies(&dependencies);
+            resources.render_pass = device
+                .create_render_pass(&render_pass_info, None)
+                .map_err(vk_err("create render pass"))?;
+
+            let framebuffer_views = [target_view];
+            let framebuffer_info = vk::FramebufferCreateInfo::default()
+                .render_pass(resources.render_pass)
+                .attachments(&framebuffer_views)
+                .width(self.extent.width)
+                .height(self.extent.height)
+                .layers(1);
+            resources.framebuffer = device
+                .create_framebuffer(&framebuffer_info, None)
+                .map_err(vk_err("create framebuffer"))?;
+
+            let vertex_entry = CString::new(vertex_entry)
+                .map_err(|_| ExecError::BadEntryPointName(vertex_entry.to_owned()))?;
+            let fragment_entry = CString::new(fragment_entry)
+                .map_err(|_| ExecError::BadEntryPointName(fragment_entry.to_owned()))?;
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(resources.module)
+                    .name(&vertex_entry),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(resources.module)
+                    .name(&fragment_entry),
+            ];
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewports = [vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.extent.width as f32,
+                height: self.extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }];
+            let scissors = [vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.extent,
+            }];
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewports(&viewports)
+                .scissors(&scissors);
+            let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .line_width(1.0);
+            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            let color_blend =
+                vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .color_blend_state(&color_blend)
+                .layout(resources.pipeline_layout)
+                .render_pass(resources.render_pass)
+                .subpass(0);
+            resources.pipeline = device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, result)| vk_err("create graphics pipeline")(result))?[0];
+        }
+        Ok(())
     }
 
     /// Overwrite the contract camera block. A no-op when the pack never
@@ -636,9 +807,11 @@ impl PackExecutor {
         Ok(())
     }
 
-    /// Record the whole schedule into `command_buffer`: for each pass, one
-    /// render pass, its pipeline + descriptor set, one fullscreen triangle.
-    /// This is the seam the layer will call inside an intercepted frame.
+    /// Record the whole schedule into `command_buffer`: for each graphics
+    /// pass one render pass, pipeline + descriptor set, one fullscreen
+    /// triangle; for each compute pass a `GENERAL` transition, the dispatch,
+    /// and a release into `SHADER_READ_ONLY_OPTIMAL`. This is the seam the
+    /// layer calls inside an intercepted frame.
     ///
     /// # Safety
     /// `command_buffer` must be in the recording state, on the queue family
@@ -646,38 +819,117 @@ impl PackExecutor {
     /// the buffer's execution completes.
     pub unsafe fn record(&self, device: &ash::Device, command_buffer: vk::CommandBuffer) {
         for pass in &self.passes {
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 0.0],
-                },
-            }];
-            let begin = vk::RenderPassBeginInfo::default()
-                .render_pass(pass.render_pass)
-                .framebuffer(pass.framebuffer)
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.extent,
-                })
-                .clear_values(&clear_values);
-            // SAFETY: all handles were created together on `device` by
-            // build(); the caller guarantees the command buffer state.
-            unsafe {
-                device.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
-                device.cmd_bind_pipeline(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pass.pipeline,
-                );
-                device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pass.pipeline_layout,
-                    0,
-                    &[pass.descriptor_set],
-                    &[],
-                );
-                device.cmd_draw(command_buffer, 3, 1, 0, 0);
-                device.cmd_end_render_pass(command_buffer);
+            match &pass.compute {
+                None => {
+                    let clear_values = [vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 0.0],
+                        },
+                    }];
+                    let begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(pass.render_pass)
+                        .framebuffer(pass.framebuffer)
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: self.extent,
+                        })
+                        .clear_values(&clear_values);
+                    // SAFETY: all handles were created together on `device` by
+                    // build(); the caller guarantees the command buffer state.
+                    unsafe {
+                        device.cmd_begin_render_pass(
+                            command_buffer,
+                            &begin,
+                            vk::SubpassContents::INLINE,
+                        );
+                        device.cmd_bind_pipeline(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pass.pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pass.pipeline_layout,
+                            0,
+                            &[pass.descriptor_set],
+                            &[],
+                        );
+                        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                        device.cmd_end_render_pass(command_buffer);
+                    }
+                }
+                Some(dispatch) => {
+                    let range = vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1);
+                    // UNDEFINED discards last frame's contents (the dispatch
+                    // rewrites every texel); the source stages order the
+                    // write-after-read against the previous frame's samplers.
+                    let acquire = vk::ImageMemoryBarrier::default()
+                        .image(dispatch.output_image)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+                        )
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(range);
+                    let release = vk::ImageMemoryBarrier::default()
+                        .image(dispatch.output_image)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(range);
+                    // SAFETY: as in the graphics arm.
+                    unsafe {
+                        device.cmd_pipeline_barrier(
+                            command_buffer,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER
+                                | vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[acquire],
+                        );
+                        device.cmd_bind_pipeline(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            pass.pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            pass.pipeline_layout,
+                            0,
+                            &[pass.descriptor_set],
+                            &[],
+                        );
+                        device.cmd_dispatch(
+                            command_buffer,
+                            dispatch.group_counts[0],
+                            dispatch.group_counts[1],
+                            dispatch.group_counts[2],
+                        );
+                        device.cmd_pipeline_barrier(
+                            command_buffer,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER
+                                | vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[release],
+                        );
+                    }
+                }
             }
         }
     }

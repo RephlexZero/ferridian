@@ -93,8 +93,8 @@ pub fn create_target(
 }
 
 /// Upload `pixels` as an RGBA8 sampled texture, left in
-/// `SHADER_READ_ONLY_OPTIMAL` visible to fragment sampling — the shape
-/// executor external inputs (`game_color`, `game_depth`) expect.
+/// `SHADER_READ_ONLY_OPTIMAL` visible to fragment and compute sampling — the
+/// shape executor external inputs (`game_color`, `game_depth`) expect.
 pub fn upload_texture(runtime: &VkRuntime, pixels: &RgbaImage) -> GpuImage {
     let device = runtime.device();
     let target = create_target(
@@ -216,7 +216,9 @@ pub fn upload_texture(runtime: &VkRuntime, pixels: &RgbaImage) -> GpuImage {
         device.cmd_pipeline_barrier(
             command_buffer,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            // Executor passes sample external inputs from fragment shaders
+            // and compute dispatches alike.
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
             &[],

@@ -284,7 +284,10 @@ impl PackCompositor {
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                     | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                     | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    // The previous composite's fragment *and compute* passes
+                    // sampled the taps — order the rewrite behind both.
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
