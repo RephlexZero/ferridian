@@ -72,7 +72,14 @@ plan (intermediate images, descriptor sets, one fullscreen pipeline per pass)
 and replays the schedule writers-before-readers. The four-pass reference pack
 — screen-space shadows → deferred lighting → volumetric fog → composite —
 runs end to end on lavapipe under validation: synthetic game frames in,
-correctly lit and fogged pixels out, deterministic across replays. Packs
+correctly lit and fogged pixels out, deterministic across replays — and the
+composite is pinned as a golden image, so any unintended shift in any pass
+fails the build. Packs mix pipeline kinds now: the volumetric pass is a
+**compute dispatch** (reflection reads the workgroup size and storage-image
+bindings straight from the SPIR-V word stream; the executor barriers the
+output between `GENERAL` and sampled around each dispatch), and converting
+it from fragment to compute reproduced the blessed golden byte for byte.
+Packs
 now read per-frame state through the contract's `camera` uniform block
 (std140, one field table drives the Rust encoder and the generated Java
 mirror), and the executor owns the buffer — updates are proven live
@@ -87,17 +94,20 @@ untouched, the embedded overlay is replaced outright, and attachment
 turnover (resize-shaped) invalidates and rebuilds cleanly. Proven end to end
 on the real loader: the reference pack lights and fogs an intercepted
 game-shaped frame, non-trigger and Unknown passes come back byte-identical.
-The Fabric shim builds against live Maven (MC 26.2, loader 0.19.3, Loom
-1.17.14, JDK 25) and CI rejects contract/codegen drift.
+Hot reload reaches through the layer too: a `PackWatcher` over the armed
+directory is polled at the composite trigger, and a newly published
+generation swaps compositors between frames (proven live — an
+inverted-composite generation 2 flips the very next frame; a corrupt
+generation 3 leaves it running). The Fabric shim builds against live Maven
+(MC 26.2, loader 0.19.3, Loom 1.17.14, JDK 25) and CI rejects
+contract/codegen drift.
 
 Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Layer-side pack hot reload: drive the compositor from `PackWatcher` (executor teardown/rebuild is already invalidation-driven; needs a safe per-frame swap point)
 - [ ] Real-game attachment tapping: intercept `vkCreateImage` to force `TRANSFER_SRC` on attachment usage, and cover `vkCreateRenderPass2`/dynamic rendering (only the classic render-pass path is intercepted today)
-- [ ] Executor v1 (remaining): compute passes, multiple render targets, per-binding sampler filters, gpu-allocator — uniform buffers landed with the contract camera (`CameraUniforms`, std140 on both sides, `update_camera` proven live on-device)
+- [ ] Executor v1 (remaining): multiple render targets, per-binding sampler filters, gpu-allocator — compute passes landed (dispatch from reflected workgroup size, storage-image output, `GENERAL`↔sampled barriers), uniform buffers landed with the contract camera
 - [ ] Shim → layer transport for per-frame camera state (the compositor uploads `CameraUniforms::placeholder()` until then)
-- [ ] Reference pack: golden-image the four passes (the placeholder camera *model* is gone — passes read the contract block; the placeholder *values* remain until the shim publishes real state)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
 - [ ] GPU-assisted validation in nightly — verified 2026-07-14 and **blocked**:
