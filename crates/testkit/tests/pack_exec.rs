@@ -245,6 +245,11 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
         "volumetric fog should separate near ({near:.1}) from far ({far:.1}) plateaus"
     );
 
+    // The pixel checks above are necessary but not sufficient — pin the
+    // exact frame so any unintended shift in any of the four passes fails
+    // the build, not just a code reviewer's eyeball.
+    ferridian_testkit::assert_matches_golden("reference_pack_composite", &first);
+
     // SAFETY: execute() fence-waits, and the readback submissions above were
     // fence-waited by read_back — no work references these objects.
     unsafe { executor.destroy(gpu.device()) };
