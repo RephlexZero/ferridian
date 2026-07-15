@@ -18,6 +18,7 @@ workspace = true
 ash = { workspace = true }
 ferridian-contract = { workspace = true }
 ferridian-engine = { workspace = true }
+gpu-allocator = { workspace = true }
 # The layer stays a shell: pack compositing logic lives in vk-rt
 # (PackCompositor/TapRegistry); the layer only feeds it intercepted events.
 ferridian-vk-rt = { workspace = true }

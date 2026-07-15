@@ -13,16 +13,20 @@
 //!
 //! This is runtime code (it will run inside someone's game), so nothing here
 //! panics: every Vulkan failure is an [`ExecError`], and a half-built
-//! executor tears down what it created before returning the error. Dedicated
-//! allocations per image are fine at reference-pack scale; a real allocator
-//! (`gpu-allocator`) arrives when pack resources get bigger and reload-churny.
+//! executor tears down what it created before returning the error. Memory
+//! comes from a shared `gpu-allocator` instance (owned by whoever builds the
+//! [`ExecContext`]) rather than one dedicated allocation per image — the
+//! reload-churny pack lifecycle can create and destroy a lot of these.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use ferridian_contract::CameraUniforms;
 use ferridian_engine::exec::{ExecutionPlan, Filter, PassPlan, SWAPCHAIN, StagePlan};
+use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 
 /// Format of every executor-created intermediate resource. Float, because
 /// passes exchange scene-referred values (the reference pack's `lit`/`fog`
@@ -39,7 +43,10 @@ pub struct ExecContext<'a> {
     pub device: &'a ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Shared across every executor/compositor on this device; an `Arc` so
+    /// it can outlive this borrowed context (executors keep it for their own
+    /// teardown, without needing a context passed back in later).
+    pub allocator: Arc<Mutex<Allocator>>,
 }
 
 /// Where the pass writing `swapchain` lands. The caller owns the image; the
@@ -62,12 +69,14 @@ pub enum ExecError {
     MissingExternalInput(String),
     #[error("plan schedules pass {0:?} but no module of that name was supplied")]
     MissingModule(String),
-    #[error("no memory type fits type bits {type_bits:#x} for {what}")]
-    NoMemoryType { what: &'static str, type_bits: u32 },
+    #[error(transparent)]
+    Allocation(#[from] gpu_allocator::AllocationError),
     #[error("entry point name {0:?} has an interior NUL byte")]
     BadEntryPointName(String),
     #[error("pass {0:?} binds the camera but no camera buffer was created")]
     CameraMissing(String),
+    #[error("camera buffer allocation is not host-mapped")]
+    CameraNotMapped,
 }
 
 pub(crate) fn vk_err(what: &'static str) -> impl FnOnce(vk::Result) -> ExecError {
@@ -75,18 +84,18 @@ pub(crate) fn vk_err(what: &'static str) -> impl FnOnce(vk::Result) -> ExecError
 }
 
 /// The contract camera uniform block, one buffer shared by every pass that
-/// binds it (host-visible + coherent, rewritten via
-/// [`PackExecutor::update_camera`]).
+/// binds it (host-visible, persistently mapped by gpu-allocator, rewritten
+/// via [`PackExecutor::update_camera`]).
 struct CameraBuffer {
     buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    allocation: Allocation,
 }
 
 /// One executor-owned image (an intermediate pass resource).
 struct Intermediate {
     name: String,
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    allocation: Allocation,
     view: vk::ImageView,
 }
 
@@ -119,6 +128,10 @@ struct PassResources {
 /// A plan instantiated on a device, reusable across frames until destroyed.
 pub struct PackExecutor {
     extent: vk::Extent2D,
+    /// Cloned from the [`ExecContext`] that built this executor, so
+    /// [`PackExecutor::destroy`] can free every allocation without needing a
+    /// context passed back in.
+    allocator: Arc<Mutex<Allocator>>,
     sampler_nearest: vk::Sampler,
     sampler_linear: vk::Sampler,
     camera: Option<CameraBuffer>,
@@ -147,6 +160,7 @@ impl PackExecutor {
     ) -> Result<PackExecutor, ExecError> {
         let mut executor = PackExecutor {
             extent,
+            allocator: ctx.allocator.clone(),
             sampler_nearest: vk::Sampler::null(),
             sampler_linear: vk::Sampler::null(),
             camera: None,
@@ -235,7 +249,7 @@ impl PackExecutor {
             self.intermediates.push(Intermediate {
                 name: resource.0.clone(),
                 image: vk::Image::null(),
-                memory: vk::DeviceMemory::null(),
+                allocation: Allocation::default(),
                 view: vk::ImageView::null(),
             });
             let Some(slot) = self.intermediates.last_mut() else {
@@ -247,15 +261,23 @@ impl PackExecutor {
                     .create_image(&image_info, None)
                     .map_err(vk_err("create intermediate image"))?;
                 let requirements = device.get_image_memory_requirements(slot.image);
-                slot.memory = allocate(
-                    device,
-                    &ctx.memory_properties,
-                    requirements,
-                    vk::MemoryPropertyFlags::empty(),
-                    "intermediate image",
-                )?;
+                slot.allocation = self
+                    .allocator
+                    .lock()
+                    .expect("allocator poisoned")
+                    .allocate(&AllocationCreateDesc {
+                        name: &format!("ferridian intermediate {}", slot.name),
+                        requirements,
+                        location: MemoryLocation::GpuOnly,
+                        linear: false,
+                        allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                    })?;
                 device
-                    .bind_image_memory(slot.image, slot.memory, 0)
+                    .bind_image_memory(
+                        slot.image,
+                        slot.allocation.memory(),
+                        slot.allocation.offset(),
+                    )
                     .map_err(vk_err("bind intermediate memory"))?;
                 let view_info = vk::ImageViewCreateInfo::default()
                     .image(slot.image)
@@ -304,7 +326,7 @@ impl PackExecutor {
             // was created if a later step fails.
             self.camera = Some(CameraBuffer {
                 buffer: vk::Buffer::null(),
-                memory: vk::DeviceMemory::null(),
+                allocation: Allocation::default(),
             });
             let Some(slot) = self.camera.as_mut() else {
                 unreachable!("assigned above");
@@ -315,21 +337,30 @@ impl PackExecutor {
                     .create_buffer(&buffer_info, None)
                     .map_err(vk_err("create camera buffer"))?;
                 let requirements = device.get_buffer_memory_requirements(slot.buffer);
-                slot.memory = allocate(
-                    device,
-                    &ctx.memory_properties,
-                    requirements,
-                    // Host-visible + coherent: rewritten from the CPU each
-                    // camera update, read as a 32-byte uniform block —
-                    // device-local placement buys nothing at this size.
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    "camera uniform buffer",
-                )?;
+                // CpuToGpu: rewritten from the CPU each camera update, read as
+                // a 32-byte uniform block — device-local placement buys
+                // nothing at this size, and gpu-allocator persistently maps
+                // host-visible allocations for us.
+                slot.allocation = self
+                    .allocator
+                    .lock()
+                    .expect("allocator poisoned")
+                    .allocate(&AllocationCreateDesc {
+                        name: "ferridian camera uniform buffer",
+                        requirements,
+                        location: MemoryLocation::CpuToGpu,
+                        linear: true,
+                        allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                    })?;
                 device
-                    .bind_buffer_memory(slot.buffer, slot.memory, 0)
+                    .bind_buffer_memory(
+                        slot.buffer,
+                        slot.allocation.memory(),
+                        slot.allocation.offset(),
+                    )
                     .map_err(vk_err("bind camera memory"))?;
                 // Nothing is submitted yet, so the initial write is safe.
-                self.update_camera(device, camera)?;
+                self.update_camera(camera)?;
             }
         }
 
@@ -830,28 +861,22 @@ impl PackExecutor {
     /// No submitted work may still be reading the buffer — either wait the
     /// frame that sampled it (as [`PackExecutor::execute`]'s fence does) or
     /// only call this before work is submitted.
-    pub unsafe fn update_camera(
-        &self,
-        device: &ash::Device,
-        camera: &CameraUniforms,
-    ) -> Result<(), ExecError> {
+    pub unsafe fn update_camera(&self, camera: &CameraUniforms) -> Result<(), ExecError> {
         let Some(buffer) = &self.camera else {
             return Ok(());
         };
         let bytes = camera.to_std140_bytes();
-        // SAFETY: the memory is HOST_VISIBLE|HOST_COHERENT and exactly
-        // STD140_SIZE bytes; the caller guarantees no in-flight readers.
+        // gpu-allocator persistently maps CpuToGpu allocations, so the
+        // pointer is already valid — no map/unmap needed (and calling
+        // vkMapMemory ourselves on already-mapped memory would be invalid).
+        let ptr = buffer
+            .allocation
+            .mapped_ptr()
+            .ok_or(ExecError::CameraNotMapped)?;
+        // SAFETY: the mapping is exactly STD140_SIZE bytes host-visible
+        // memory; the caller guarantees no in-flight readers.
         unsafe {
-            let ptr = device
-                .map_memory(
-                    buffer.memory,
-                    0,
-                    CameraUniforms::STD140_SIZE as u64,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .map_err(vk_err("map camera memory"))?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            device.unmap_memory(buffer.memory);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().cast::<u8>(), bytes.len());
         }
         Ok(())
     }
@@ -1045,52 +1070,24 @@ impl PackExecutor {
             }
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.descriptor_pool = vk::DescriptorPool::null();
+            let mut allocator = self.allocator.lock().expect("allocator poisoned");
             for intermediate in self.intermediates.drain(..) {
                 device.destroy_image_view(intermediate.view, None);
                 device.destroy_image(intermediate.image, None);
-                device.free_memory(intermediate.memory, None);
+                // A free() failure here would only mean a leaked block in an
+                // allocator we're not tearing down (the device may outlive
+                // this executor) — nothing to recover into, so it's dropped.
+                let _ = allocator.free(intermediate.allocation);
             }
             if let Some(camera) = self.camera.take() {
                 device.destroy_buffer(camera.buffer, None);
-                device.free_memory(camera.memory, None);
+                let _ = allocator.free(camera.allocation);
             }
+            drop(allocator);
             device.destroy_sampler(self.sampler_nearest, None);
             self.sampler_nearest = vk::Sampler::null();
             device.destroy_sampler(self.sampler_linear, None);
             self.sampler_linear = vk::Sampler::null();
         }
     }
-}
-
-/// Dedicated allocation: whatever the caller requires, preferring
-/// device-local among the qualifying types (lavapipe advertises everything
-/// host-visible, so both picks usually agree there).
-pub(crate) fn allocate(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    requirements: vk::MemoryRequirements,
-    required: vk::MemoryPropertyFlags,
-    what: &'static str,
-) -> Result<vk::DeviceMemory, ExecError> {
-    let pick = |must_have: vk::MemoryPropertyFlags| {
-        memory_properties.memory_types[..memory_properties.memory_type_count as usize]
-            .iter()
-            .enumerate()
-            .position(|(index, memory_type)| {
-                requirements.memory_type_bits & (1 << index) != 0
-                    && memory_type.property_flags.contains(must_have)
-            })
-    };
-    let type_index = pick(required | vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        .or_else(|| pick(required))
-        .ok_or(ExecError::NoMemoryType {
-            what,
-            type_bits: requirements.memory_type_bits,
-        })? as u32;
-    let allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(type_index);
-    // SAFETY: valid allocate info; the caller stores and later frees the
-    // memory via destroy().
-    unsafe { device.allocate_memory(&allocate_info, None) }.map_err(vk_err("allocate memory"))
 }

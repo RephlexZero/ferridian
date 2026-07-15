@@ -16,13 +16,16 @@
 //! app destroys one of them ([`PackCompositor::invalidate_view`]).
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use ferridian_contract::CameraUniforms;
 use ferridian_engine::exec::{ExecutionPlan, WireError, plan_execution};
 use ferridian_engine::pack::LoadedPack;
+use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 
-use crate::exec::{ExecContext, ExecError, OutputTarget, PackExecutor, allocate, vk_err};
+use crate::exec::{ExecContext, ExecError, OutputTarget, PackExecutor, vk_err};
 use crate::tap::{ResolvedAttachment, ResolvedFrame};
 
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +43,7 @@ struct Tap {
     source: ResolvedAttachment,
     source_is_depth: bool,
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    allocation: Allocation,
     view: vk::ImageView,
 }
 
@@ -60,7 +63,7 @@ pub struct PackCompositor {
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
-    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    allocator: Arc<Mutex<Allocator>>,
     plan: ExecutionPlan,
     modules: BTreeMap<String, Vec<u32>>,
     built: Option<Built>,
@@ -113,7 +116,7 @@ impl PackCompositor {
         device: ash::Device,
         queue: vk::Queue,
         queue_family_index: u32,
-        memory_properties: vk::PhysicalDeviceMemoryProperties,
+        allocator: Arc<Mutex<Allocator>>,
         pack: &LoadedPack,
     ) -> Result<PackCompositor, WireError> {
         let plan = plan_execution(pack)?;
@@ -121,7 +124,7 @@ impl PackCompositor {
             device,
             queue,
             queue_family_index,
-            memory_properties,
+            allocator,
             plan,
             modules: pack.modules.clone(),
             built: None,
@@ -341,7 +344,7 @@ impl PackCompositor {
                     source,
                     source_is_depth,
                     image: vk::Image::null(),
-                    memory: vk::DeviceMemory::null(),
+                    allocation: Allocation::default(),
                     view: vk::ImageView::null(),
                 });
                 let Some(tap) = taps.last_mut() else {
@@ -365,15 +368,25 @@ impl PackCompositor {
                         .map_err(vk_err("create tap image"))
                         .map_err(CompositorError::Exec)?;
                     let requirements = device.get_image_memory_requirements(tap.image);
-                    tap.memory = allocate(
-                        device,
-                        &self.memory_properties,
-                        requirements,
-                        vk::MemoryPropertyFlags::empty(),
-                        "tap image",
-                    )?;
+                    tap.allocation = self
+                        .allocator
+                        .lock()
+                        .expect("allocator poisoned")
+                        .allocate(&AllocationCreateDesc {
+                            name: &format!("ferridian tap {}", tap.name),
+                            requirements,
+                            location: MemoryLocation::GpuOnly,
+                            linear: false,
+                            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                        })
+                        .map_err(ExecError::from)
+                        .map_err(CompositorError::Exec)?;
                     device
-                        .bind_image_memory(tap.image, tap.memory, 0)
+                        .bind_image_memory(
+                            tap.image,
+                            tap.allocation.memory(),
+                            tap.allocation.offset(),
+                        )
                         .map_err(vk_err("bind tap memory"))
                         .map_err(CompositorError::Exec)?;
                     let view_info = vk::ImageViewCreateInfo::default()
@@ -396,7 +409,7 @@ impl PackCompositor {
         })();
         if let Err(error) = result {
             // SAFETY: the taps were never recorded anywhere yet.
-            unsafe { destroy_taps(device, &mut taps) };
+            unsafe { destroy_taps(device, &self.allocator, &mut taps) };
             return Err(error);
         }
 
@@ -408,7 +421,7 @@ impl PackCompositor {
             device,
             queue: self.queue,
             queue_family_index: self.queue_family_index,
-            memory_properties: self.memory_properties,
+            allocator: self.allocator.clone(),
         };
         let output = OutputTarget {
             view: frame.color.view,
@@ -435,7 +448,7 @@ impl PackCompositor {
             }),
             Err(error) => {
                 // SAFETY: as above — nothing has been submitted.
-                unsafe { destroy_taps(device, &mut taps) };
+                unsafe { destroy_taps(device, &self.allocator, &mut taps) };
                 Err(CompositorError::Exec(error))
             }
         }
@@ -476,7 +489,7 @@ impl PackCompositor {
             // SAFETY: per the callers' contracts — the objects are idle.
             unsafe {
                 built.executor.destroy(&self.device);
-                destroy_taps(&self.device, &mut built.taps);
+                destroy_taps(&self.device, &self.allocator, &mut built.taps);
             }
         }
     }
@@ -484,14 +497,16 @@ impl PackCompositor {
 
 /// # Safety
 /// The tap objects must not be referenced by submitted work.
-unsafe fn destroy_taps(device: &ash::Device, taps: &mut Vec<Tap>) {
+unsafe fn destroy_taps(device: &ash::Device, allocator: &Mutex<Allocator>, taps: &mut Vec<Tap>) {
+    let mut allocator = allocator.lock().expect("allocator poisoned");
     for tap in taps.drain(..) {
         // SAFETY: created on `device`; destroying nulls is a no-op.
         unsafe {
             device.destroy_image_view(tap.view, None);
             device.destroy_image(tap.image, None);
-            device.free_memory(tap.memory, None);
         }
+        // As in PackExecutor::destroy: nothing to recover into on failure.
+        let _ = allocator.free(tap.allocation);
     }
 }
 

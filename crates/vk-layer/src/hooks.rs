@@ -5,14 +5,15 @@
 //! never grows logic — classification lives in [`ferridian_engine::frame`].
 
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use ferridian_contract::{Contract, GamePassKind};
 use ferridian_engine::frame::PassObserver;
 use ferridian_engine::pack::{PackWatcher, load_pack};
 use ferridian_vk_rt::PackCompositor;
+use gpu_allocator::vulkan::Allocator;
 
 /// Artifact directory to composite over intercepted frames. Read once per
 /// device creation; a [`PackWatcher`] over the same directory drives hot
@@ -53,9 +54,13 @@ pub(crate) fn create_compositor(
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
-    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    allocator: Option<Arc<Mutex<Allocator>>>,
 ) -> Option<PackCompositor> {
     let dir = std::env::var_os(PACK_ENV)?;
+    let Some(allocator) = allocator else {
+        tracing::warn!("pack compositing disabled: gpu-allocator failed to initialize");
+        return None;
+    };
     let pack = match load_pack(Path::new(&dir), 0) {
         Ok(pack) => pack,
         Err(error) => {
@@ -63,7 +68,7 @@ pub(crate) fn create_compositor(
             return None;
         }
     };
-    match PackCompositor::new(device, queue, queue_family_index, memory_properties, &pack) {
+    match PackCompositor::new(device, queue, queue_family_index, allocator, &pack) {
         Ok(compositor) => {
             tracing::info!(
                 pack = %dir.to_string_lossy(),
@@ -102,7 +107,7 @@ pub(crate) fn poll_reload(
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
-    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    allocator: Option<Arc<Mutex<Allocator>>>,
 ) -> Option<PackCompositor> {
     let pack = match watcher.poll()? {
         Ok(pack) => pack,
@@ -111,7 +116,11 @@ pub(crate) fn poll_reload(
             return None;
         }
     };
-    match PackCompositor::new(device, queue, queue_family_index, memory_properties, &pack) {
+    let Some(allocator) = allocator else {
+        tracing::warn!("pack reload skipped: gpu-allocator failed to initialize");
+        return None;
+    };
+    match PackCompositor::new(device, queue, queue_family_index, allocator, &pack) {
         Ok(compositor) => {
             tracing::info!(
                 generation = pack.generation,

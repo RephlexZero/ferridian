@@ -186,13 +186,10 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
     // submission, so nothing in flight is reading the buffer.
     unsafe {
         executor
-            .update_camera(
-                gpu.device(),
-                &CameraUniforms {
-                    far_plane: 8.0,
-                    ..CameraUniforms::placeholder()
-                },
-            )
+            .update_camera(&CameraUniforms {
+                far_plane: 8.0,
+                ..CameraUniforms::placeholder()
+            })
             .expect("camera updates");
     }
     executor
@@ -211,7 +208,7 @@ fn reference_pack_executes_end_to_end_on_a_real_device() {
     // SAFETY: as above — the sunless execution was fence-waited.
     unsafe {
         executor
-            .update_camera(gpu.device(), &CameraUniforms::placeholder())
+            .update_camera(&CameraUniforms::placeholder())
             .expect("camera restores");
     }
     executor.execute(&ctx).expect("pack re-executes restored");

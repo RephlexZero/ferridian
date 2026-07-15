@@ -20,7 +20,7 @@ pub use hooks::PACK_ENV;
 pub use loader_interface::LAYER_NAME;
 
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use ash::vk::Handle;
@@ -257,7 +257,7 @@ unsafe extern "system" fn ferridian_cmd_end_render_pass(command_buffer: vk::Comm
                     state.device.clone(),
                     state.queue,
                     state.queue_family_index,
-                    state.memory_properties,
+                    state.allocator.clone(),
                 )
             }) {
                 let mut compositor = state.compositor.lock().expect("compositor lock poisoned");
@@ -734,26 +734,56 @@ unsafe extern "system" fn ferridian_create_device(
     };
     // SAFETY: queue 0 of a family the app requested exists per the create info.
     let queue = unsafe { device_table.get_device_queue(queue_family_index, 0) };
-    type PfnGetPhysicalDeviceMemoryProperties =
-        unsafe extern "system" fn(vk::PhysicalDevice, *mut vk::PhysicalDeviceMemoryProperties);
-    // SAFETY: querying a physical-device-level function down-chain and
-    // calling it with the live physical device; the out-struct is plain data.
-    let memory_properties = unsafe {
-        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
-        if let Some(pfn) = next_gipa(instance, c"vkGetPhysicalDeviceMemoryProperties".as_ptr()) {
-            let pfn = std::mem::transmute::<
-                unsafe extern "system" fn(),
-                PfnGetPhysicalDeviceMemoryProperties,
-            >(pfn);
-            pfn(physical_device, &mut properties);
+
+    // A full ash::Instance table, built the same way device_table was built
+    // above, purely so gpu-allocator can query memory/physical-device
+    // properties itself rather than the layer hand-rolling that lookup.
+    // SAFETY: forwarding proc-addr lookups down the chain, exactly as for
+    // device_table above.
+    let instance_table = unsafe {
+        ash::Instance::load_with(
+            |name| {
+                // `vkGetDeviceProcAddr` is technically an instance-level
+                // command, so ash's loader queries it here too — but this
+                // loader/layer stack segfaults answering that query through
+                // `next_gipa` mid-vkCreateDevice (observed on lavapipe+VVL).
+                // We already have the correct pointer from the device
+                // layer-info directly, so short-circuit to it.
+                if name.to_bytes() == b"vkGetDeviceProcAddr" {
+                    return next_gdpa as *const c_void;
+                }
+                std::mem::transmute::<vk::PFN_vkVoidFunction, *const c_void>(next_gipa(
+                    instance,
+                    name.as_ptr(),
+                ))
+            },
+            instance,
+        )
+    };
+    let allocator =
+        gpu_allocator::vulkan::Allocator::new(&gpu_allocator::vulkan::AllocatorCreateDesc {
+            instance: instance_table,
+            device: device_table.clone(),
+            physical_device,
+            debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+            buffer_device_address: false,
+            allocation_sizes: gpu_allocator::AllocationSizes::default(),
+        });
+    let allocator = match allocator {
+        Ok(allocator) => Some(Arc::new(Mutex::new(allocator))),
+        Err(error) => {
+            // Pack compositing needs an allocator; everything else the layer
+            // does (overlay, taps, vanilla forwarding) does not, so the
+            // device is still usable — just never composites a pack.
+            tracing::warn!(%error, "gpu-allocator init failed; pack compositing disabled");
+            None
         }
-        properties
     };
     let compositor = hooks::create_compositor(
         device_table.clone(),
         queue,
         queue_family_index,
-        memory_properties,
+        allocator.clone(),
     );
     let pack_watcher = hooks::create_watcher();
 
@@ -785,7 +815,7 @@ unsafe extern "system" fn ferridian_create_device(
             device: device_table,
             queue,
             queue_family_index,
-            memory_properties,
+            allocator,
         },
     );
     hooks::device_created();

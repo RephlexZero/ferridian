@@ -10,11 +10,12 @@
 //! where only a `VkCommandBuffer` is in hand.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ash::vk;
 use ferridian_engine::pack::PackWatcher;
 use ferridian_vk_rt::{PackCompositor, TapRegistry};
+use gpu_allocator::vulkan::Allocator;
 
 use crate::overlay::Overlay;
 
@@ -118,7 +119,11 @@ pub(crate) struct DeviceState {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// `None` when gpu-allocator failed to initialize for this device (never
+    /// observed in practice — the same physical device just built a working
+    /// `VkDevice` — but handled rather than assumed since this is runtime
+    /// code); compositing then stays permanently disabled.
+    pub allocator: Option<Arc<Mutex<Allocator>>>,
 }
 
 static INSTANCES: RwLock<BTreeMap<usize, InstanceState>> = RwLock::new(BTreeMap::new());

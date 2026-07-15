@@ -15,10 +15,12 @@ pub use ferridian_contract::CameraUniforms;
 pub use tap::{ResolvedAttachment, ResolvedFrame, TapRegistry, ViewRecord};
 
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use ash::ext::debug_utils;
 use ash::vk;
+use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
@@ -64,6 +66,8 @@ pub enum RuntimeError {
     NoSuitableDevice,
     #[error("app name contains an interior NUL byte")]
     BadAppName,
+    #[error(transparent)]
+    Allocator(#[from] gpu_allocator::AllocationError),
 }
 
 struct DebugMessenger {
@@ -82,6 +86,11 @@ pub struct VkRuntime {
     queue_family_index: u32,
     device_name: String,
     validation_messages: Arc<Mutex<Vec<String>>>,
+    /// `ManuallyDrop` so [`Drop for VkRuntime`] can free it before
+    /// `destroy_device` — gpu-allocator's own `Drop` frees any remaining
+    /// blocks via `vkFreeMemory`, which is invalid on an already-destroyed
+    /// device.
+    allocator: ManuallyDrop<Arc<Mutex<Allocator>>>,
 }
 
 impl VkRuntime {
@@ -206,6 +215,32 @@ impl VkRuntime {
         // SAFETY: the queue family/index were validated during device creation.
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
+        let allocator = Allocator::new(&AllocatorCreateDesc {
+            instance: instance.clone(),
+            device: device.clone(),
+            physical_device,
+            debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+            buffer_device_address: false,
+            allocation_sizes: gpu_allocator::AllocationSizes::default(),
+        });
+        let allocator = match allocator {
+            Ok(allocator) => allocator,
+            Err(error) => {
+                // SAFETY: device/debug/instance were all created above and
+                // nothing else owns them yet.
+                unsafe {
+                    device.destroy_device(None);
+                    if let Some(debug) = &debug {
+                        debug
+                            .loader
+                            .destroy_debug_utils_messenger(debug.messenger, None);
+                    }
+                    instance.destroy_instance(None);
+                }
+                return Err(error.into());
+            }
+        };
+
         tracing::info!(device = %device_name, software = options.prefer_software_device, "vulkan runtime ready");
 
         Ok(VkRuntime {
@@ -218,6 +253,7 @@ impl VkRuntime {
             queue_family_index,
             device_name,
             validation_messages,
+            allocator: ManuallyDrop::new(Arc::new(Mutex::new(allocator))),
         })
     }
 
@@ -245,14 +281,6 @@ impl VkRuntime {
         &self.device_name
     }
 
-    pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
-        // SAFETY: the physical device was enumerated from this instance.
-        unsafe {
-            self.instance
-                .get_physical_device_memory_properties(self.physical_device)
-        }
-    }
-
     /// This runtime's device-side handles, in the form [`exec::PackExecutor`]
     /// consumes (inside the layer the same struct is built from the
     /// intercepted application's device instead).
@@ -261,7 +289,7 @@ impl VkRuntime {
             device: &self.device,
             queue: self.queue,
             queue_family_index: self.queue_family_index,
-            memory_properties: self.memory_properties(),
+            allocator: (*self.allocator).clone(),
         }
     }
 
@@ -277,9 +305,15 @@ impl VkRuntime {
 impl Drop for VkRuntime {
     fn drop(&mut self) {
         // SAFETY: all handles were created by this runtime and are destroyed
-        // exactly once, device before messenger before instance.
+        // exactly once, device before messenger before instance. Waiting
+        // idle first means nothing submitted still references memory the
+        // allocator is about to free.
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Dropped here (not left to the field's own destructor) so it
+            // runs while `self.device` is still valid — gpu-allocator's Drop
+            // calls vkFreeMemory on any remaining blocks.
+            ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
             if let Some(debug) = self.debug.take() {
                 debug

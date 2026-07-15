@@ -320,6 +320,7 @@ dependencies = [
  "ferridian-pack-compiler",
  "ferridian-testkit",
  "ferridian-vk-rt",
+ "gpu-allocator",
  "libloading",
  "serde_json",
  "tracing",
