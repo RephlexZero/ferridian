@@ -26,6 +26,10 @@ pub fn render_java(contract: &Contract) -> Vec<(String, String)> {
             format!("{GENERATED_DIR}/CameraUniforms.java"),
             render_camera_record(),
         ),
+        (
+            format!("{GENERATED_DIR}/NativeBridge.java"),
+            render_native_bridge(),
+        ),
     ]
 }
 
@@ -134,6 +138,46 @@ fn render_camera_record() -> String {
     out
 }
 
+fn capitalize(field: &str) -> String {
+    let mut chars = field.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Native declarations for the shim → Vulkan layer camera transport,
+/// rendered from the same std140 field table `CameraUniforms` is, so the
+/// JNI parameter order (and each getter's name) cannot drift from the
+/// encoder or the Rust receiver in `ferridian-vk-layer::camera_transport`.
+fn render_native_bridge() -> String {
+    let fields: Vec<String> = CameraUniforms::STD140_FIELDS
+        .iter()
+        .map(|(name, _)| java_field_name(name))
+        .collect();
+    let mut out = String::from(HEADER);
+    out.push_str(&format!("package {JAVA_PACKAGE};\n\n"));
+    out.push_str(
+        "/**\n * Native declarations for the shim -> Vulkan layer camera transport. Load\n * the layer's cdylib with {@code System.load} before calling these — an\n * {@link UnsatisfiedLinkError} otherwise. Parameter order mirrors {@link\n * CameraUniforms}'s std140 field table exactly.\n */\n",
+    );
+    out.push_str("public final class NativeBridge {\n    private NativeBridge() {}\n\n");
+    out.push_str("    public static native void publishCamera(\n");
+    let params: Vec<String> = fields
+        .iter()
+        .map(|name| format!("            float {name}"))
+        .collect();
+    out.push_str(&params.join(",\n"));
+    out.push_str(");\n\n");
+    for name in &fields {
+        out.push_str(&format!(
+            "    public static native float current{}();\n",
+            capitalize(name)
+        ));
+    }
+    out.push_str("}\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,7 +185,7 @@ mod tests {
     #[test]
     fn generated_java_is_stable() {
         let files = render_java(&Contract::current());
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4);
         for (path, content) in &files {
             insta::assert_snapshot!(path.replace('/', "_"), content);
         }

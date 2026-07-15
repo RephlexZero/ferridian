@@ -11,8 +11,12 @@ import net.fabricmc.api.ClientModInitializer;
  * {@link io.ferridian.shim.contract}. Everything in that package is generated
  * by {@code tools/shim-codegen}; never edit it by hand.
  *
- * <p>TODO(M2): publish {@link FerridianContract#PASSES} to the engine once the
- * Vulkan layer's transport lands.
+ * <p>The camera transport ({@link io.ferridian.shim.contract.NativeBridge})
+ * now exists — {@code System.load} the layer's cdylib, then
+ * {@code NativeBridge.publishCamera(...)} once per frame. Wiring that to
+ * the game's actual camera/sun state, and publishing {@link
+ * FerridianContract#PASSES}, wait on real Vulkan layer injection into a
+ * live game process (still the M2 remainder — see overhaul.md).
  */
 public final class FerridianShim implements ClientModInitializer {
     @Override

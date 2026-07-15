@@ -91,8 +91,18 @@ a shared `gpu-allocator` instance per device rather than one dedicated
 now read per-frame state through the contract's `camera` uniform block
 (std140, one field table drives the Rust encoder and the generated Java
 mirror), and the executor owns the buffer — updates are proven live
-on-device, with the placeholder values uploaded until the shim publishes
-real ones. And the
+on-device. **The shim → layer camera transport now exists**: the same
+std140 field table also drives a generated `NativeBridge` (JNI native
+declarations — one setter, one getter per field), the layer receives
+published values into a small process-global store
+(`ferridian-vk-layer::camera_transport`), and the compositor reads through
+it every frame instead of a hardcoded constant. Proven end to end by a real
+JVM — not a stand-in — loading the actual cdylib and calling the actual
+generated `NativeBridge.java` via `System.load`, publishing values and
+reading them straight back. What still feeds it the placeholder is real
+Minecraft-side capture (sun angle, clip planes) — like the rest of the
+shim's game-facing code, that waits on real Vulkan layer injection into a
+live game process (the M2 remainder). And the
 layer↔executor seam is closed: with a pack artifact armed (`FERRIDIAN_PACK`),
 the layer tracks the app's views/framebuffers/render passes, and at the end
 of the world-final classified pass taps its color+depth attachments, runs
@@ -143,11 +153,20 @@ since a module mixing vertex and fragment entry points is exactly the shape
 VVL's GPU-assisted validation refuses to instrument ("Mixed stage shader
 module not supported").
 
+The shim is now a multi-module Gradle build: `shim/core` holds the generated
+contract and stays loader-agnostic, `shim/fabric` is the Fabric entrypoint
+(depends on `core`, embeds its classes directly into the jar task — 26.x
+ships unobfuscated, so Loom's usual remapJar-hooked include() mechanism has
+nothing to attach to). A `neoforge` module is the natural next addition
+alongside it. Supply-chain: `cargo-vet` is seeded (`supply-chain/`, every
+current dependency audited or exempted) and wired into the `gates` CI job
+alongside `cargo-deny`.
+
 Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Shim → layer transport for per-frame camera state (the compositor uploads `CameraUniforms::placeholder()` until then)
+- [ ] Real Minecraft-side camera capture (sun angle, clip planes) over the now-existing shim → layer transport — waits on the same real-game injection as above
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
-- [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
+- [ ] Release attestations; cargo-semver-checks on publish (still blocked: every workspace crate is `publish = false`)
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
 - [ ] Photon port permission outreach (human task, before any port work)

@@ -137,6 +137,27 @@ impl PackCompositor {
         self.plan.passes.len()
     }
 
+    /// Upload this frame's camera state — the layer calls this once per
+    /// composited frame, immediately before [`PackCompositor::record_over`],
+    /// with whatever the shim → layer transport last published (see
+    /// `ferridian_vk_layer::camera_transport`). A no-op until the compositor
+    /// has built (nothing to upload into yet).
+    ///
+    /// Unsynchronized against a still-in-flight previous frame's read of the
+    /// same buffer — the same frame-pacing assumption `record_over` already
+    /// makes for the tap images it rewrites every frame without a fence
+    /// wait. Real per-swapchain-image resources are the same M2-remainder
+    /// follow-up as the taps' (needs a real game to prove against).
+    pub fn update_camera(&mut self, camera: &CameraUniforms) {
+        let Some(built) = &self.built else {
+            return;
+        };
+        // SAFETY: see the doc comment above.
+        if let Err(error) = unsafe { built.executor.update_camera(camera) } {
+            tracing::warn!(%error, "camera update failed; the frame keeps its previous values");
+        }
+    }
+
     /// Record the pack over the intercepted frame: tap copies, then the
     /// executor's schedule, leaving the app's color attachment in the layout
     /// its own render pass had declared. Called after the app's render pass
@@ -434,9 +455,10 @@ impl PackCompositor {
             &self.modules,
             frame.extent,
             &external_inputs,
-            // The layer has no shim channel yet, so packs get the same
-            // placeholder state their constants used to hard-code; real
-            // per-frame values arrive with the shim IPC (tracked follow-up).
+            // The very first triggering frame builds before the layer's
+            // per-frame `update_camera` call can reach an executor to write
+            // into (see `PackCompositor::update_camera`) — one frame of the
+            // placeholder, then whatever the shim has published since.
             &CameraUniforms::placeholder(),
             &output,
         ) {
