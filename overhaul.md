@@ -45,7 +45,7 @@ We do **not** compete for the "default shader loader" position (Aperture wins th
 ### 3.1 Interception strategy
 
 - **Primary seam:** Vulkan layer (implicit/explicit) in Rust (`ash`). Stable, Khronos-versioned ABI; survives game updates by construction. ReShade-style.
-- **Semantic seam:** thin Fabric shim publishing pass metadata (which pipeline = terrain/entities/etc.) over a versioned contract. Regenerated per MC version — mechanically, from unobfuscated sources.
+- **Semantic seam:** thin, loader-agnostic shim publishing pass metadata (which pipeline = terrain/entities/etc.) and per-frame camera state over a versioned contract. Regenerated per MC version — mechanically, from unobfuscated sources. Fabric is the first entrypoint; NeoForge is a planned sibling module, not a rearchitecture (§3.4).
 - **Discipline:** the layer cdylib stays *boring*. All logic lives in `engine`/`vk-rt` behind a clean seam so Miri and unit tests reach maximal code.
 
 ### 3.2 Pack format
@@ -59,6 +59,38 @@ We do **not** compete for the "default shader loader" position (Aperture wins th
 
 - Target Vulkan 1.3 core + `VK_KHR_portability_subset` compliance for the macOS/MoltenVK path (Mojang's stated reason for the migration is keeping macOS alive → portability subset is the de facto conformance target).
 - Capability tiers: `baseline` (portability-clean), `enhanced` (mesh shading, ray query where present). Engine validates pack requirements against a committed device profile set (incl. MoltenVK profile) at pack build time.
+
+### 3.4 Mod-loader targets
+
+The layer is the real engine; the shim's only job is the semantic seam (§3.1)
+plus, as of the camera transport, publishing per-frame state through a
+generated JNI bridge — neither depends on Fabric. That split is now real in
+the repo, not just aspirational: `shim/core` holds the generated contract
+(`GamePassKind`, `FerridianContract`, `CameraUniforms`) and the generated
+`NativeBridge` (one JNI setter/getter pair per contract field, so the wire
+order can't drift from `ferridian-contract`'s own field table); it has zero
+Fabric or Loom dependency. `shim/fabric` depends on `core`, adds only what
+Fabric needs — the Loom toolchain, the Minecraft/Loader coordinates,
+`FerridianShim implements ClientModInitializer` — and, since Minecraft 26.x
+ships unobfuscated (Loom never wires a `remapJar` here, so its usual
+`include()` jar-in-jar mechanism has nothing to attach to), embeds `core`'s
+compiled classes directly into its own `jar` task output instead.
+
+Supporting a second loader is adding a sibling module, not rearchitecting:
+a planned `shim/neoforge` depends on `shim/core` exactly like `fabric` does,
+swaps `net.fabricmc.fabric-loom` for NeoForge's **ModDevGradle** plugin, and
+replaces `ClientModInitializer` with NeoForge's `@Mod`-annotated entrypoint
+(registered on the mod-bus `FMLClientSetupEvent` instead of Fabric's
+client-init callback). Because the shim still does no mixins or
+loader-specific game hooks — it's a thin publisher over the contract, not a
+gameplay mod — there's no Fabric-specific logic to port; `core`'s generated
+sources and native bridge are consumed identically by both. The dependency
+NeoForge's toolchain needs (`https://maven.neoforged.net/releases/`) is
+reachable from CI/devcontainer today, so the module is a matter of writing
+it and wiring a `shim` CI job leg for it (mirroring the existing Fabric
+`shim` job), not a new unblock. Not yet started — tracked as a follow-up
+(README) rather than scaffolded, since it should land with its own build
+verification pass rather than as a drive-by.
 
 ---
 
@@ -83,7 +115,10 @@ We do **not** compete for the "default shader loader" position (Aperture wins th
 │   ├── packc/                   # shader-author CLI: build / validate / serve (hot reload)
 │   ├── shim-codegen/            # contract → generated Java
 │   └── upstream-watch/          # MC manifest poll → decompile → signature diff
-├── shim/                        # Gradle + Loom; ~90% generated
+├── shim/                        # Gradle multi-project; ~90% generated
+│   ├── core/                    #   loader-agnostic: generated contract + native bridge
+│   ├── fabric/                  #   Fabric entrypoint (Loom); depends on core
+│   └── neoforge/                #   planned — see §3.4
 ├── packs/reference/             # the marquee pack; dogfoods packc from day one
 ├── goldens/                     # git-lfs image baselines
 ├── ci/mesa.Dockerfile           # pinned lavapipe; also the devcontainer base image
@@ -101,7 +136,7 @@ We do **not** compete for the "default shader loader" position (Aperture wins th
 | Git hooks | ✅ **lefthook**, <5 s budget | fmt check, typos, taplo, commit-lint only. Advisory UX; CI is the enforcement layer. Wired by `mise run setup`. |
 | Test runner | ✅ **cargo-nextest** | Parallelism, retries for rare lavapipe flakes, JUnit output. |
 | Snapshots | ✅ **insta** | SPIR-V reflection dumps + codegen output as reviewable snapshots. |
-| Supply chain | ⏳ cargo-deny ✅ + **cargo-vet** + cargo-auditable + GitHub artifact attestations (SLSA) | We ship a cdylib injected next to people's game — verifiable builds are ethics *and* marketing. *(deny wired and green; vet/auditable/attestations are M1+ follow-ups — see README checklist)* |
+| Supply chain | ✅ cargo-deny + **cargo-vet** (seeded `supply-chain/`, every dependency audited or exempted) + ⏳ cargo-auditable + GitHub artifact attestations (SLSA) | We ship a cdylib injected next to people's game — verifiable builds are ethics *and* marketing. *(deny + vet wired and green in `gates`; auditable/attestations remain M1+ follow-ups — see README checklist)* |
 | Deps/releases | ⏳ Dependabot (cargo/gradle/actions, grouped weekly) ✅; release-plz pending | *(commit-lint hook in place; `.github/dependabot.yml` activates on push)* |
 | Deliberately skipped (for now) | Nix, Bazel, cargo-hakari, OSS-Fuzz enrolment | Bloat at this stage; revisit at scale. |
 

@@ -166,6 +166,7 @@ Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
 - [ ] Real Minecraft-side camera capture (sun angle, clip planes) over the now-existing shim → layer transport — waits on the same real-game injection as above
+- [ ] `shim/neoforge`: a sibling module depending on `shim/core`, via NeoForge's ModDevGradle (plan in overhaul.md §3.4; NeoForge maven is already reachable from CI/devcontainer)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] Release attestations; cargo-semver-checks on publish (still blocked: every workspace crate is `publish = false`)
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
