@@ -110,18 +110,44 @@ generation 3 leaves it running). The Fabric shim builds against live Maven
 (MC 26.2, loader 0.19.3, Loom 1.17.14, JDK 25) and CI rejects
 contract/codegen drift.
 
+The layer's attachment coverage now reaches beyond the classic render-pass
+path: `vkCreateRenderPass2`/`vkCmdBeginRenderPass2{,KHR}`/
+`vkCmdEndRenderPass2{,KHR}` classify and composite exactly like
+`vkCreateRenderPass`/`vkCmdBeginRenderPass`/`vkCmdEndRenderPass` (same
+`VkRenderPassBeginInfo`, same code); `VK_KHR_dynamic_rendering`
+(`vkCmdBeginRendering`/`vkCmdEndRendering`) has no render-pass/framebuffer
+object at all, so its attachments are resolved directly from
+`VkRenderingInfo` at begin time and carried on the active pass (the embedded
+overlay skeleton, which builds pipelines against a `VkRenderPass`, simply
+stays out of these passes — a real pack's compositor has no such
+limitation). And `vkCreateImage` now forces `TRANSFER_SRC` onto
+attachment-usage images the app didn't request it for (checked against
+`vkGetPhysicalDeviceImageFormatProperties` before patching), so the
+compositor's tap-copy works against an unmodified game's own images.
+Proving this real-loader coverage surfaced two genuine bugs along the way:
+`VK_EXT_debug_utils`'s `Cmd*` label commands are spec-classified as
+instance-level despite taking a command buffer, so GDPA-only interception
+left classification silently dead whenever this layer sits above
+`VK_LAYER_KHRONOS_validation` in the enabled-layers order; and the layer's
+own gpu-allocator instance was held by two `Arc` clones that only dropped
+*after* `vkDestroyDevice` forwarded to the real device — a use-after-free,
+fixed by explicitly dropping both first (the same `ManuallyDrop` discipline
+`VkRuntime` already uses).
+
+GPU-assisted validation is unblocked and wired into nightly: every
+`VkShaderModule` the codebase creates — pack artifacts, the layer's embedded
+overlay, testkit's own render harness — is now single-stage (`packc`
+compiles each entry point to its own SPIR-V module via `slangc -entry
+... -stage ...`, discovered from a never-shipped combined probe compile),
+since a module mixing vertex and fragment entry points is exactly the shape
+VVL's GPU-assisted validation refuses to instrument ("Mixed stage shader
+module not supported").
+
 Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Real-game attachment tapping: intercept `vkCreateImage` to force `TRANSFER_SRC` on attachment usage, and cover `vkCreateRenderPass2`/dynamic rendering (only the classic render-pass path is intercepted today)
 - [ ] Shim → layer transport for per-frame camera state (the compositor uploads `CameraUniforms::placeholder()` until then)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
-- [ ] GPU-assisted validation in nightly — verified 2026-07-14 and **blocked**:
-      VVL cannot instrument slangc's mixed-stage modules ("Mixed stage shader
-      module not supported"), and its on-disk shader_validation_cache masks
-      that error on every run after the first (delete
-      `~/.cache/{instrumented_shader,shader_validation}_cache*` to reproduce).
-      Needs per-stage module emission in pack-compiler first
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
 - [ ] Photon port permission outreach (human task, before any port work)
