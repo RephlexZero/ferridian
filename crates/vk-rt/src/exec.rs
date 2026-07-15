@@ -22,7 +22,7 @@ use std::ffi::CString;
 
 use ash::vk;
 use ferridian_contract::CameraUniforms;
-use ferridian_engine::exec::{ExecutionPlan, PassPlan, SWAPCHAIN, StagePlan};
+use ferridian_engine::exec::{ExecutionPlan, Filter, PassPlan, SWAPCHAIN, StagePlan};
 
 /// Format of every executor-created intermediate resource. Float, because
 /// passes exchange scene-referred values (the reference pack's `lit`/`fog`
@@ -119,7 +119,8 @@ struct PassResources {
 /// A plan instantiated on a device, reusable across frames until destroyed.
 pub struct PackExecutor {
     extent: vk::Extent2D,
-    sampler: vk::Sampler,
+    sampler_nearest: vk::Sampler,
+    sampler_linear: vk::Sampler,
     camera: Option<CameraBuffer>,
     intermediates: Vec<Intermediate>,
     descriptor_pool: vk::DescriptorPool,
@@ -146,7 +147,8 @@ impl PackExecutor {
     ) -> Result<PackExecutor, ExecError> {
         let mut executor = PackExecutor {
             extent,
-            sampler: vk::Sampler::null(),
+            sampler_nearest: vk::Sampler::null(),
+            sampler_linear: vk::Sampler::null(),
             camera: None,
             intermediates: Vec::new(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -176,22 +178,30 @@ impl PackExecutor {
     ) -> Result<(), ExecError> {
         let device = ctx.device;
 
-        // NEAREST, not LINEAR: every sampled resource is a same-extent tap or
-        // intermediate read at texel centers, where the two are identical —
-        // and depth-format taps are legal to sample NEAREST everywhere, while
-        // linear filtering of depth is an optional format feature. Per-binding
-        // filter configuration arrives with executor v1.
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        // One sampler per manifest filter mode, shared by every binding that
+        // asks for it. NEAREST is the default (same-extent reads at texel
+        // centers are filter-invariant, and depth-format taps are legal to
+        // sample NEAREST everywhere, while linear filtering of depth is an
+        // optional format feature); LINEAR is opt-in per binding via the
+        // pass's `filters` table.
+        let sampler_info = |filter: vk::Filter| {
+            vk::SamplerCreateInfo::default()
+                .mag_filter(filter)
+                .min_filter(filter)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        };
         // SAFETY: create infos below only borrow locals that outlive the
         // call they are passed to; every created handle is stored in `self`,
         // whose destroy() pairs each with the matching destroy call.
-        self.sampler = unsafe { device.create_sampler(&sampler_info, None) }
-            .map_err(vk_err("create sampler"))?;
+        self.sampler_nearest =
+            unsafe { device.create_sampler(&sampler_info(vk::Filter::NEAREST), None) }
+                .map_err(vk_err("create nearest sampler"))?;
+        // SAFETY: as above.
+        self.sampler_linear =
+            unsafe { device.create_sampler(&sampler_info(vk::Filter::LINEAR), None) }
+                .map_err(vk_err("create linear sampler"))?;
 
         // How an intermediate is written decides its usage: compute outputs
         // are storage images, graphics outputs are color attachments (the
@@ -556,8 +566,12 @@ impl PackExecutor {
                             let view = views.get(binding.resource.0.as_str()).copied().ok_or_else(
                                 || ExecError::MissingExternalInput(binding.resource.0.clone()),
                             )?;
+                            let sampler = match binding.filter {
+                                Filter::Nearest => self.sampler_nearest,
+                                Filter::Linear => self.sampler_linear,
+                            };
                             Ok([vk::DescriptorImageInfo::default()
-                                .sampler(self.sampler)
+                                .sampler(sampler)
                                 .image_view(view)
                                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)])
                         })
@@ -1040,8 +1054,10 @@ impl PackExecutor {
                 device.destroy_buffer(camera.buffer, None);
                 device.free_memory(camera.memory, None);
             }
-            device.destroy_sampler(self.sampler, None);
-            self.sampler = vk::Sampler::null();
+            device.destroy_sampler(self.sampler_nearest, None);
+            self.sampler_nearest = vk::Sampler::null();
+            device.destroy_sampler(self.sampler_linear, None);
+            self.sampler_linear = vk::Sampler::null();
         }
     }
 }

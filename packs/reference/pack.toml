@@ -39,3 +39,9 @@ kind = "graphics"
 shader = "shaders/composite.slang"
 inputs = ["lit", "fog"]
 outputs = ["swapchain"]
+# Linear is the right call for scene-referred color once passes run at mixed
+# resolutions; today every read lands on texel centers, where linear and the
+# nearest default are identical — the pinned golden proves the filter table
+# flows through the artifact without moving a byte. Depth reads elsewhere
+# stay nearest (linear-filtered depth is an optional format feature).
+filters = { lit = "linear", fog = "linear" }
