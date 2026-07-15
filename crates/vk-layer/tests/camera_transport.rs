@@ -64,7 +64,10 @@ fn native_bridge_round_trips_through_a_real_jvm() {
     // A published sun direction that isn't a unit vector: this test only
     // proves the transport carries values through unchanged, not the
     // contract's placeholder invariants.
-    let dylib_path = dylib.to_str().expect("dylib path is valid UTF-8");
+    let dylib_path = dylib
+        .to_str()
+        .expect("dylib path is valid UTF-8")
+        .replace("\\", "/");
     let harness = format!(
         r#"
 import io.ferridian.shim.contract.NativeBridge;
