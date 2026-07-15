@@ -110,6 +110,9 @@ struct PassResources {
     pipeline: vk::Pipeline,
     /// Freed with the pool.
     descriptor_set: vk::DescriptorSet,
+    /// One clear per color attachment (empty for compute passes) — the
+    /// render pass begin must supply exactly as many as it declared.
+    clear_values: Vec<vk::ClearValue>,
     compute: Option<ComputeDispatch>,
 }
 
@@ -198,7 +201,7 @@ impl PackExecutor {
             .passes
             .iter()
             .filter(|pass| matches!(pass.stage, StagePlan::Compute { .. }))
-            .map(|pass| pass.output.0.as_str())
+            .filter_map(|pass| pass.outputs.first().map(|output| output.0.as_str()))
             .collect();
         for resource in &plan.intermediates {
             let write_usage = if compute_written.contains(&resource.0.as_str()) {
@@ -383,19 +386,27 @@ impl PackExecutor {
         output: &OutputTarget,
     ) -> Result<PassResources, ExecError> {
         let device = ctx.device;
-        let writes_swapchain = pass.output.0 == SWAPCHAIN;
-        let (target_view, target_format) = if writes_swapchain {
-            (output.view, output.format)
-        } else {
-            let view = views
-                .get(pass.output.0.as_str())
-                .copied()
-                // Unreachable for a plan from `plan_execution` (every
-                // intermediate was just created), kept as an error because
-                // this is runtime code.
-                .ok_or_else(|| ExecError::MissingExternalInput(pass.output.0.clone()))?;
-            (view, INTERMEDIATE_FORMAT)
-        };
+        let writes_swapchain = pass.outputs.iter().any(|resource| resource.0 == SWAPCHAIN);
+        // One (view, format) per output — the color attachments of a
+        // graphics pass, in the plan's location order. The planner keeps the
+        // swapchain writer single-output, so mixed formats never happen.
+        let targets: Vec<(vk::ImageView, vk::Format)> = pass
+            .outputs
+            .iter()
+            .map(|resource| {
+                if resource.0 == SWAPCHAIN {
+                    return Ok((output.view, output.format));
+                }
+                views
+                    .get(resource.0.as_str())
+                    .copied()
+                    // Unreachable for a plan from `plan_execution` (every
+                    // intermediate was just created), kept as an error
+                    // because this is runtime code.
+                    .ok_or_else(|| ExecError::MissingExternalInput(resource.0.clone()))
+                    .map(|view| (view, INTERMEDIATE_FORMAT))
+            })
+            .collect::<Result<_, ExecError>>()?;
         let shader_stages = match pass.stage {
             StagePlan::Graphics { .. } => vk::ShaderStageFlags::FRAGMENT,
             StagePlan::Compute { .. } => vk::ShaderStageFlags::COMPUTE,
@@ -409,6 +420,7 @@ impl PackExecutor {
             module: vk::ShaderModule::null(),
             pipeline: vk::Pipeline::null(),
             descriptor_set: vk::DescriptorSet::null(),
+            clear_values: Vec::new(),
             compute: None,
         };
         // On failure, hand the partial resources to `self` so destroy()
@@ -485,8 +497,7 @@ impl PackExecutor {
                         &mut resources,
                         vertex_entry,
                         fragment_entry,
-                        target_view,
-                        target_format,
+                        &targets,
                         writes_swapchain,
                         output,
                     )?,
@@ -510,15 +521,15 @@ impl PackExecutor {
                                 None,
                             )
                             .map_err(|(_, result)| vk_err("create compute pipeline")(result))?[0];
-                        let output_image = images
-                            .get(pass.output.0.as_str())
+                        let output_image = pass
+                            .outputs
+                            .first()
+                            .and_then(|resource| images.get(resource.0.as_str()))
                             .copied()
-                            // Unreachable as for target_view above: compute
-                            // outputs are always intermediates (the planner
-                            // rejects compute→swapchain).
-                            .ok_or_else(|| {
-                                ExecError::MissingExternalInput(pass.output.0.clone())
-                            })?;
+                            // Unreachable as for targets above: a compute
+                            // output is always a single intermediate (the
+                            // planner rejects compute→swapchain and MRT).
+                            .ok_or_else(|| ExecError::MissingExternalInput(pass.name.clone()))?;
                         resources.compute = Some(ComputeDispatch {
                             group_counts: [
                                 self.extent.width.div_ceil(workgroup_size[0].max(1)),
@@ -592,9 +603,12 @@ impl PackExecutor {
                 let output_info = pass
                     .output_binding
                     .map(|_| {
-                        let view = views.get(pass.output.0.as_str()).copied().ok_or_else(|| {
-                            ExecError::MissingExternalInput(pass.output.0.clone())
-                        })?;
+                        let view = pass
+                            .outputs
+                            .first()
+                            .and_then(|resource| views.get(resource.0.as_str()))
+                            .copied()
+                            .ok_or_else(|| ExecError::MissingExternalInput(pass.name.clone()))?;
                         Ok::<_, ExecError>([vk::DescriptorImageInfo::default()
                             .image_view(view)
                             .image_layout(vk::ImageLayout::GENERAL)])
@@ -623,7 +637,8 @@ impl PackExecutor {
     }
 
     /// The graphics half of [`PackExecutor::build_pass`]: render pass,
-    /// framebuffer, and the fullscreen-triangle pipeline. `resources.module`
+    /// framebuffer, and the fullscreen-triangle pipeline over one color
+    /// attachment per target (fragment location order). `resources.module`
     /// and `resources.pipeline_layout` must already be created.
     #[expect(
         clippy::too_many_arguments,
@@ -635,14 +650,13 @@ impl PackExecutor {
         resources: &mut PassResources,
         vertex_entry: &str,
         fragment_entry: &str,
-        target_view: vk::ImageView,
-        target_format: vk::Format,
+        targets: &[(vk::ImageView, vk::Format)],
         writes_swapchain: bool,
         output: &OutputTarget,
     ) -> Result<(), ExecError> {
-        // Written by exactly one pass (graph-guaranteed), then only
-        // sampled — the render pass carries the transition, the exit
-        // dependency makes the write visible to consumers.
+        // Each target is written by exactly one pass (graph-guaranteed),
+        // then only sampled — the render pass carries the transition, the
+        // exit dependency makes the writes visible to consumers.
         let final_layout = if writes_swapchain {
             output.final_layout
         } else {
@@ -664,18 +678,27 @@ impl PackExecutor {
         // SAFETY: as in build_pass — create infos borrow locals that outlive
         // each call; every handle lands in `resources`.
         unsafe {
-            let attachments = [vk::AttachmentDescription::default()
-                .format(target_format)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(final_layout)];
-            let color_refs = [vk::AttachmentReference::default()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let attachments: Vec<vk::AttachmentDescription> = targets
+                .iter()
+                .map(|&(_, format)| {
+                    vk::AttachmentDescription::default()
+                        .format(format)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED)
+                        .final_layout(final_layout)
+                })
+                .collect();
+            let color_refs: Vec<vk::AttachmentReference> = (0..targets.len() as u32)
+                .map(|location| {
+                    vk::AttachmentReference::default()
+                        .attachment(location)
+                        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                })
+                .collect();
             let subpasses = [vk::SubpassDescription::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                 .color_attachments(&color_refs)];
@@ -702,7 +725,8 @@ impl PackExecutor {
                 .create_render_pass(&render_pass_info, None)
                 .map_err(vk_err("create render pass"))?;
 
-            let framebuffer_views = [target_view];
+            let framebuffer_views: Vec<vk::ImageView> =
+                targets.iter().map(|&(view, _)| view).collect();
             let framebuffer_info = vk::FramebufferCreateInfo::default()
                 .render_pass(resources.render_pass)
                 .attachments(&framebuffer_views)
@@ -752,8 +776,11 @@ impl PackExecutor {
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-            let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            let blend_attachments = vec![
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::RGBA);
+                targets.len()
+            ];
             let color_blend =
                 vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
             let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
@@ -771,6 +798,14 @@ impl PackExecutor {
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
                 .map_err(|(_, result)| vk_err("create graphics pipeline")(result))?[0];
         }
+        resources.clear_values = vec![
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
+                },
+            };
+            targets.len()
+        ];
         Ok(())
     }
 
@@ -821,11 +856,6 @@ impl PackExecutor {
         for pass in &self.passes {
             match &pass.compute {
                 None => {
-                    let clear_values = [vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 0.0],
-                        },
-                    }];
                     let begin = vk::RenderPassBeginInfo::default()
                         .render_pass(pass.render_pass)
                         .framebuffer(pass.framebuffer)
@@ -833,7 +863,7 @@ impl PackExecutor {
                             offset: vk::Offset2D { x: 0, y: 0 },
                             extent: self.extent,
                         })
-                        .clear_values(&clear_values);
+                        .clear_values(&pass.clear_values);
                     // SAFETY: all handles were created together on `device` by
                     // build(); the caller guarantees the command buffer state.
                     unsafe {
