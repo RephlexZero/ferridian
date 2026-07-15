@@ -11,6 +11,7 @@ taplo = "0.9"
 typos = "1"
 "cargo:cargo-nextest" = "0.9"
 "cargo:cargo-deny" = "0.18"
+"cargo:cargo-vet" = "0.10"
 # slangc is intentionally NOT mise-managed: its release tarball is bin/slangc
 # dynamically linked against sibling lib/*.so files, but the ubi backend only
 # extracts a single executable and drops those libs, so the result can't run
@@ -65,3 +66,7 @@ run = "gradle -p shim build"
 [tasks.deny]
 description = "Supply-chain gate"
 run = "cargo deny check"
+
+[tasks.vet]
+description = "Supply-chain audit gate (see supply-chain/)"
+run = "cargo vet check"

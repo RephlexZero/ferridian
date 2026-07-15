@@ -25,9 +25,9 @@ Dual-licensed MIT or Apache-2.0.
 | `crates/contract` | single source of truth: Java↔Rust ABI + pass metadata |
 | `crates/testkit` | lavapipe bootstrap; **any validation error fails the test** |
 | `tools/packc` | pack-author CLI: build / validate / serve |
-| `tools/shim-codegen` | contract → generated Java (`shim/src/main/generated`) |
+| `tools/shim-codegen` | contract → generated Java (`shim/core/src/main/generated`) |
 | `tools/upstream-watch` | Mojang manifest poll + signature-inventory diff |
-| `shim/` | Fabric mod shell (~90% generated) |
+| `shim/` | Mod-loader shells (~90% generated): `core` loader-agnostic, `fabric` the Fabric entrypoint |
 | `packs/reference` | the marquee pack; dogfoods packc from day one |
 | `goldens/` | git-lfs image baselines (harness lands M1) |
 | `ci/mesa.Dockerfile` | the one container image: pinned lavapipe, CI + devcontainer |

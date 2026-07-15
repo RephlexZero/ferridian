@@ -12,3 +12,8 @@ pluginManagement {
 }
 
 rootProject.name = "ferridian-shim"
+
+// core: loader-agnostic contract + native bridge. fabric: the Fabric
+// entrypoint. A neoforge module is planned alongside fabric — see
+// overhaul.md's shim section.
+include("core", "fabric")

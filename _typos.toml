@@ -1,5 +1,7 @@
 [files]
 # Historical plan-of-record prose ("Lumen is taken by UE", pack author names).
 # The upstream-watch inventory is *derived from Mojang's classfiles verbatim* —
-# their identifiers (typos included) are the data, not our prose.
-extend-exclude = ["overhaul.md", "tools/upstream-watch/data/inventory.toml"]
+# their identifiers (typos included) are the data, not our prose. supply-chain/
+# is cargo-vet's own machine-generated audit data (real crate names like
+# `flate2`, `writeable` read as typos out of context).
+extend-exclude = ["overhaul.md", "tools/upstream-watch/data/inventory.toml", "supply-chain/"]

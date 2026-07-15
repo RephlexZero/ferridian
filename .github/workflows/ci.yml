@@ -99,7 +99,7 @@ jobs:
         # regenerated shim must fail here, not at game load time.
         run: |
           cargo run -p shim-codegen
-          git diff --exit-code shim/src/main/generated
+          git diff --exit-code shim/core/src/main/generated
 
   gates:
     needs: lint
@@ -107,5 +107,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
-      # Follow-ups (README): cargo-semver-checks once crates are published,
-      # cargo-vet once the audit set is seeded.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-vet
+      - run: cargo vet check
+      # Follow-up (README): cargo-semver-checks once a crate is actually
+      # published — every crate in the workspace is `publish = false` today.

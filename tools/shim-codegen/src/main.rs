@@ -13,7 +13,7 @@ use ferridian_contract::Contract;
 )]
 struct Cli {
     /// Java source root to emit into.
-    #[arg(long, default_value = "shim/src/main/generated")]
+    #[arg(long, default_value = "shim/core/src/main/generated")]
     out: PathBuf,
 }
 

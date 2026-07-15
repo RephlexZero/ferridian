@@ -2,7 +2,7 @@
 **/target
 /.gradle
 /shim/.gradle
-/shim/build
+/shim/**/build
 /docs/book
 /.DS_Store
 *.iml

@@ -1,4 +1,5 @@
-# cargo-deny baseline. cargo-vet + artifact attestations are tracked follow-ups (see README).
+# cargo-deny baseline. cargo-vet lives in supply-chain/ (see mise.toml's `vet`
+# task); release attestations are still a tracked follow-up (see README).
 
 [graph]
 all-features = true
