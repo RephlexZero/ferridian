@@ -13,6 +13,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Re-exported so executors take the filter from the same module as the plan.
+pub use ferridian_pack_format::Filter;
 use ferridian_pack_format::{
     EntryPointReflection, PackManifest, PassKind as ManifestPassKind, ShaderReflection,
     reflect_spirv,
@@ -126,6 +128,9 @@ pub enum WireError {
 pub struct BindingPlan {
     pub binding: u32,
     pub resource: ResourceId,
+    /// How the executor's sampler filters this input (from the manifest's
+    /// per-pass `filters` table; nearest when unlisted).
+    pub filter: Filter,
 }
 
 /// How a pass runs on the device: a fullscreen-triangle graphics pipeline or
@@ -374,6 +379,7 @@ pub fn plan_with_reflections(
             bindings.push(BindingPlan {
                 binding: reflected.binding,
                 resource: ResourceId(name.to_owned()),
+                filter: pass.filters.get(name).copied().unwrap_or_default(),
             });
         }
         for input in &pass.inputs {
@@ -623,6 +629,34 @@ mod tests {
             vec![(0, "game_color"), (1, "game_depth"), (2, "shadow_mask")]
         );
         assert_eq!(plan.passes[2].outputs, vec![ResourceId("swapchain".into())]);
+    }
+
+    #[test]
+    fn wires_declared_filters_and_defaults_to_nearest() {
+        let filtered = manifest(
+            "[[pass]]\nname = \"composite\"\nkind = \"graphics\"\nshader = \"c.slang\"\n\
+             inputs = [\"game_color\", \"game_depth\"]\noutputs = [\"swapchain\"]\n\
+             filters = { game_color = \"linear\" }\n",
+        );
+        let reflections = BTreeMap::from([(
+            "composite".to_owned(),
+            reflection(vec![
+                sampler(0, 0, "game_color"),
+                sampler(0, 1, "game_depth"),
+            ]),
+        )]);
+        let plan = plan(&filtered, &reflections).unwrap();
+        assert_eq!(
+            plan.passes[0]
+                .bindings
+                .iter()
+                .map(|binding| (binding.resource.0.as_str(), binding.filter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("game_color", Filter::Linear),
+                ("game_depth", Filter::Nearest)
+            ]
+        );
     }
 
     #[test]
