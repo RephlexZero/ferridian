@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ferridian_engine::pack::{PackWatcher, ReloadError};
+use ferridian_engine::pack::{PackWatcher, PassModules, ReloadError};
 use ferridian_pack_compiler::write_generation;
 
 /// A fresh scratch artifact directory per test (std-only tempdir).
@@ -57,10 +57,19 @@ fn fake_spirv(tag: u32) -> Vec<u8> {
 
 fn publish(out: &std::path::Path, generation: u64, tag: u32) {
     fs::write(out.join("manifest.toml"), MANIFEST).unwrap();
-    fs::write(out.join("lighting.spv"), fake_spirv(tag)).unwrap();
-    fs::write(out.join("composite.spv"), fake_spirv(tag + 1)).unwrap();
+    fs::write(out.join("lighting.compute.spv"), fake_spirv(tag)).unwrap();
+    fs::write(out.join("composite.vertex.spv"), fake_spirv(tag + 1)).unwrap();
+    fs::write(out.join("composite.fragment.spv"), fake_spirv(tag + 1)).unwrap();
     // The real producer: artifact files first, then the atomic bump.
     write_generation(out, generation).unwrap();
+}
+
+/// Pull the tag word back out of a loaded pack's module for assertions.
+fn tag_of(modules: &PassModules) -> u32 {
+    match modules {
+        PassModules::Compute { compute } => compute[5],
+        PassModules::Graphics { fragment, .. } => fragment[5],
+    }
 }
 
 #[test]
@@ -78,8 +87,8 @@ fn watcher_delivers_each_generation_exactly_once() {
     // Execution order re-derived from the graph, and both modules decoded.
     assert_eq!(pack.execution_order, vec![0, 1]);
     assert_eq!(pack.modules.len(), 2);
-    assert_eq!(pack.modules["lighting"][5], 100);
-    assert_eq!(pack.modules["composite"][5], 101);
+    assert_eq!(tag_of(&pack.modules["lighting"]), 100);
+    assert_eq!(tag_of(&pack.modules["composite"]), 101);
 
     // Same generation → silent.
     assert!(watcher.poll().is_none());
@@ -89,7 +98,7 @@ fn watcher_delivers_each_generation_exactly_once() {
     publish(&out, 2, 200);
     let pack = watcher.poll().expect("generation 2 visible").unwrap();
     assert_eq!(pack.generation, 2);
-    assert_eq!(pack.modules["lighting"][5], 200);
+    assert_eq!(tag_of(&pack.modules["lighting"]), 200);
     assert!(watcher.poll().is_none());
 
     fs::remove_dir_all(&out).ok();
@@ -104,7 +113,7 @@ fn broken_artifact_reports_once_then_recovers_on_next_generation() {
     watcher.poll().expect("generation 1").unwrap();
 
     // A corrupt module: reported exactly once, not retried every poll.
-    fs::write(out.join("composite.spv"), &fake_spirv(0)[..9]).unwrap();
+    fs::write(out.join("composite.fragment.spv"), &fake_spirv(0)[..9]).unwrap();
     write_generation(&out, 2).unwrap();
     let error = watcher.poll().expect("failure surfaces").unwrap_err();
     assert!(
@@ -117,7 +126,7 @@ fn broken_artifact_reports_once_then_recovers_on_next_generation() {
     publish(&out, 3, 300);
     let pack = watcher.poll().expect("generation 3").unwrap();
     assert_eq!(pack.generation, 3);
-    assert_eq!(pack.modules["composite"][5], 301);
+    assert_eq!(tag_of(&pack.modules["composite"]), 301);
 
     fs::remove_dir_all(&out).ok();
 }

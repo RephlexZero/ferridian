@@ -4,8 +4,11 @@
 //!
 //! The overlay pipeline is built lazily against the application's own
 //! `VkRenderPass` handle (that is what makes it render-pass-compatible) from
-//! the committed `shaders/overlay.spv`; a layer living inside a game process
-//! has no shader compiler. Every Vulkan call here goes through a *down-chain*
+//! the committed `shaders/overlay.{vertex,fragment}.spv` — two modules,
+//! never one mixing both entry points (that's exactly the shape
+//! GPU-assisted validation can't instrument); a layer living inside a game
+//! process has no shader compiler. Every Vulkan call here goes through a
+//! *down-chain*
 //! `ash::Device` loaded from the next layer's GDPA, so the layer never
 //! re-enters itself.
 //!
@@ -23,16 +26,26 @@ use ash::vk;
 use ash::vk::Handle;
 use ferridian_contract::GamePassKind;
 
-static OVERLAY_SPV: &[u8] = include_bytes!("../shaders/overlay.spv");
+// Two modules, never one mixing both entry points — that's exactly the shape
+// GPU-assisted validation can't instrument.
+static OVERLAY_VERTEX_SPV: &[u8] = include_bytes!("../shaders/overlay.vertex.spv");
+static OVERLAY_FRAGMENT_SPV: &[u8] = include_bytes!("../shaders/overlay.fragment.spv");
 
-fn overlay_words() -> &'static [u32] {
+fn words_of(bytes: &'static [u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("chunks_exact(4)")))
+        .collect()
+}
+
+fn overlay_vertex_words() -> &'static [u32] {
     static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-    WORDS.get_or_init(|| {
-        OVERLAY_SPV
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("chunks_exact(4)")))
-            .collect()
-    })
+    WORDS.get_or_init(|| words_of(OVERLAY_VERTEX_SPV))
+}
+
+fn overlay_fragment_words() -> &'static [u32] {
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| words_of(OVERLAY_FRAGMENT_SPV))
 }
 
 /// A render pass currently being recorded into a command buffer, keyed by
@@ -72,7 +85,8 @@ pub(crate) fn pass_ending(command_buffer: vk::CommandBuffer) -> Option<ActivePas
 /// per application render pass. Lives inside the device's dispatch entry.
 pub(crate) struct Overlay {
     device: ash::Device,
-    shader_module: vk::ShaderModule,
+    vertex_module: vk::ShaderModule,
+    fragment_module: vk::ShaderModule,
     pipeline_layout: vk::PipelineLayout,
     /// `None` records a pipeline that failed to build (incompatible pass) so
     /// the failure is not retried every frame.
@@ -84,12 +98,23 @@ impl Overlay {
     /// (calls through it never re-enter the layer). `None` (logged) disables
     /// the overlay for this device.
     pub(crate) fn new(device: ash::Device) -> Option<Overlay> {
-        let module_info = vk::ShaderModuleCreateInfo::default().code(overlay_words());
+        let vertex_info = vk::ShaderModuleCreateInfo::default().code(overlay_vertex_words());
         // SAFETY: valid create info over the embedded (build-verified) SPIR-V.
-        let shader_module = match unsafe { device.create_shader_module(&module_info, None) } {
+        let vertex_module = match unsafe { device.create_shader_module(&vertex_info, None) } {
             Ok(module) => module,
             Err(error) => {
-                tracing::warn!(%error, "overlay disabled: shader module creation failed");
+                tracing::warn!(%error, "overlay disabled: vertex shader module creation failed");
+                return None;
+            }
+        };
+        let fragment_info = vk::ShaderModuleCreateInfo::default().code(overlay_fragment_words());
+        // SAFETY: as above.
+        let fragment_module = match unsafe { device.create_shader_module(&fragment_info, None) } {
+            Ok(module) => module,
+            Err(error) => {
+                // SAFETY: destroying the module created above, unused elsewhere.
+                unsafe { device.destroy_shader_module(vertex_module, None) };
+                tracing::warn!(%error, "overlay disabled: fragment shader module creation failed");
                 return None;
             }
         };
@@ -99,15 +124,19 @@ impl Overlay {
         } {
             Ok(layout) => layout,
             Err(error) => {
-                // SAFETY: destroying the module created above, unused elsewhere.
-                unsafe { device.destroy_shader_module(shader_module, None) };
+                // SAFETY: destroying the modules created above, unused elsewhere.
+                unsafe {
+                    device.destroy_shader_module(vertex_module, None);
+                    device.destroy_shader_module(fragment_module, None);
+                }
                 tracing::warn!(%error, "overlay disabled: pipeline layout creation failed");
                 return None;
             }
         };
         Some(Overlay {
             device,
-            shader_module,
+            vertex_module,
+            fragment_module,
             pipeline_layout,
             pipelines: BTreeMap::new(),
         })
@@ -120,11 +149,11 @@ impl Overlay {
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(self.shader_module)
+                .module(self.vertex_module)
                 .name(c"vs_main"),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.shader_module)
+                .module(self.fragment_module)
                 .name(c"fs_main"),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -226,7 +255,9 @@ impl Overlay {
             }
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_shader_module(self.shader_module, None);
+            self.device.destroy_shader_module(self.vertex_module, None);
+            self.device
+                .destroy_shader_module(self.fragment_module, None);
         }
         self.pipelines.clear();
     }
@@ -238,9 +269,13 @@ mod tests {
 
     #[test]
     fn embedded_overlay_spirv_is_wellformed() {
-        let words = overlay_words();
-        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
-        assert_eq!(OVERLAY_SPV.len() % 4, 0, "whole words");
-        assert!(words.len() > 5, "more than a bare header");
+        for (words, bytes) in [
+            (overlay_vertex_words(), OVERLAY_VERTEX_SPV),
+            (overlay_fragment_words(), OVERLAY_FRAGMENT_SPV),
+        ] {
+            assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+            assert_eq!(bytes.len() % 4, 0, "whole words");
+            assert!(words.len() > 5, "more than a bare header");
+        }
     }
 }

@@ -55,8 +55,7 @@ jobs:
           -p ferridian-engine
 
   # Synchronization validation on lavapipe: the slow VVL mode that catches
-  # hazard bugs plain validation misses. GPU-assisted validation joins once
-  # its lavapipe support is verified.
+  # hazard bugs plain validation misses.
   sync-validation:
     runs-on: ubuntu-latest
     steps:
@@ -70,6 +69,43 @@ jobs:
           cat > vk_layer_settings.txt <<'EOF'
           khronos_validation.validate_sync = true
           khronos_validation.syncval_shader_accesses_heuristic = true
+          EOF
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e FERRIDIAN_GPU_TESTS=1 \
+            -e VK_LAYER_SETTINGS_PATH=/work/vk_layer_settings.txt \
+            ferridian-mesa:ci \
+            bash -ec 'rustup show >/dev/null; cargo test -p ferridian-testkit -p ferridian-vk-layer'
+      - name: Upload failing renders + heatmaps
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: nightly-golden-failures
+          path: target/golden-failures/
+          if-no-files-found: ignore
+
+  # GPU-assisted validation on lavapipe: shader-side instrumentation catching
+  # OOB/uninitialized-descriptor bugs plain validation can't see. Its own job
+  # (not combined with sync-validation — the two VVL modes are independently
+  # diagnosable, and older VVL releases couldn't run them concurrently at
+  # all). Was blocked until every VkShaderModule the test suite creates was
+  # single-stage (see overhaul.md, closed 2026-07-15) — VVL cannot instrument
+  # a module mixing vertex and fragment entry points ("Mixed stage shader
+  # module not supported"), and its on-disk shader_validation_cache masks
+  # that error on every run after the first (a fresh container per run means
+  # CI never hits that trap, but `rm ~/.cache/{instrumented_shader,shader_validation}_cache*`
+  # reproduces it locally).
+  gpu-assisted-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - name: Build pinned Mesa image
+        run: docker build -f ci/mesa.Dockerfile -t ferridian-mesa:ci .
+      - name: GPU tests with GPU-assisted validation (any message fails)
+        run: |
+          cat > vk_layer_settings.txt <<'EOF'
+          khronos_validation.validate_gpu_based = GPU_BASED_GPU_ASSISTED
           EOF
           docker run --rm -v "$PWD:/work" -w /work \
             -e FERRIDIAN_GPU_TESTS=1 \

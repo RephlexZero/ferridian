@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use ferridian_contract::CameraUniforms;
 use ferridian_engine::exec::{ExecutionPlan, Filter, PassPlan, SWAPCHAIN, StagePlan};
+use ferridian_engine::pack::PassModules;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 
@@ -69,6 +70,8 @@ pub enum ExecError {
     MissingExternalInput(String),
     #[error("plan schedules pass {0:?} but no module of that name was supplied")]
     MissingModule(String),
+    #[error("pass {0:?} is planned as {1} but its supplied modules are shaped for the other kind")]
+    ModuleKindMismatch(String, &'static str),
     #[error(transparent)]
     Allocation(#[from] gpu_allocator::AllocationError),
     #[error("entry point name {0:?} has an interior NUL byte")]
@@ -115,7 +118,13 @@ struct PassResources {
     pipeline_layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
-    module: vk::ShaderModule,
+    /// Exactly one `VkShaderModule` per stage the pass actually has: graphics
+    /// fills `vertex_module`/`fragment_module` and leaves `compute_module`
+    /// null, compute is the reverse. Never one module shared across stages —
+    /// that's the shape GPU-assisted validation can't instrument.
+    vertex_module: vk::ShaderModule,
+    fragment_module: vk::ShaderModule,
+    compute_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
     /// Freed with the pool.
     descriptor_set: vk::DescriptorSet,
@@ -152,7 +161,7 @@ impl PackExecutor {
     pub fn new(
         ctx: &ExecContext<'_>,
         plan: &ExecutionPlan,
-        modules: &BTreeMap<String, Vec<u32>>,
+        modules: &BTreeMap<String, PassModules>,
         extent: vk::Extent2D,
         external_inputs: &BTreeMap<String, vk::ImageView>,
         camera: &CameraUniforms,
@@ -185,7 +194,7 @@ impl PackExecutor {
         &mut self,
         ctx: &ExecContext<'_>,
         plan: &ExecutionPlan,
-        modules: &BTreeMap<String, Vec<u32>>,
+        modules: &BTreeMap<String, PassModules>,
         external_inputs: &BTreeMap<String, vk::ImageView>,
         camera: &CameraUniforms,
         output: &OutputTarget,
@@ -421,7 +430,7 @@ impl PackExecutor {
         &mut self,
         ctx: &ExecContext<'_>,
         pass: &PassPlan,
-        modules: &BTreeMap<String, Vec<u32>>,
+        modules: &BTreeMap<String, PassModules>,
         views: &BTreeMap<String, vk::ImageView>,
         images: &BTreeMap<String, vk::Image>,
         output: &OutputTarget,
@@ -458,7 +467,9 @@ impl PackExecutor {
             pipeline_layout: vk::PipelineLayout::null(),
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
-            module: vk::ShaderModule::null(),
+            vertex_module: vk::ShaderModule::null(),
+            fragment_module: vk::ShaderModule::null(),
+            compute_module: vk::ShaderModule::null(),
             pipeline: vk::Pipeline::null(),
             descriptor_set: vk::DescriptorSet::null(),
             clear_values: Vec::new(),
@@ -521,36 +532,58 @@ impl PackExecutor {
                     .create_pipeline_layout(&pipeline_layout_info, None)
                     .map_err(vk_err("create pipeline layout"))?;
 
-                let words = modules
+                let pass_modules = modules
                     .get(&pass.name)
                     .ok_or_else(|| ExecError::MissingModule(pass.name.clone()))?;
-                let module_info = vk::ShaderModuleCreateInfo::default().code(words);
-                resources.module = device
-                    .create_shader_module(&module_info, None)
-                    .map_err(vk_err("create shader module"))?;
+                let create_module = |words: &[u32]| {
+                    device.create_shader_module(
+                        &vk::ShaderModuleCreateInfo::default().code(words),
+                        None,
+                    )
+                };
 
                 match &pass.stage {
                     StagePlan::Graphics {
                         vertex_entry,
                         fragment_entry,
-                    } => self.build_graphics_pipeline(
-                        device,
-                        &mut resources,
-                        vertex_entry,
-                        fragment_entry,
-                        &targets,
-                        writes_swapchain,
-                        output,
-                    )?,
+                    } => {
+                        let PassModules::Graphics { vertex, fragment } = pass_modules else {
+                            return Err(ExecError::ModuleKindMismatch(
+                                pass.name.clone(),
+                                "graphics",
+                            ));
+                        };
+                        resources.vertex_module =
+                            create_module(vertex).map_err(vk_err("create vertex shader module"))?;
+                        resources.fragment_module = create_module(fragment)
+                            .map_err(vk_err("create fragment shader module"))?;
+                        self.build_graphics_pipeline(
+                            device,
+                            &mut resources,
+                            vertex_entry,
+                            fragment_entry,
+                            &targets,
+                            writes_swapchain,
+                            output,
+                        )?
+                    }
                     StagePlan::Compute {
                         entry,
                         workgroup_size,
                     } => {
+                        let PassModules::Compute { compute } = pass_modules else {
+                            return Err(ExecError::ModuleKindMismatch(
+                                pass.name.clone(),
+                                "compute",
+                            ));
+                        };
+                        resources.compute_module = create_module(compute)
+                            .map_err(vk_err("create compute shader module"))?;
                         let entry_name = CString::new(entry.as_str())
                             .map_err(|_| ExecError::BadEntryPointName(entry.clone()))?;
                         let stage_info = vk::PipelineShaderStageCreateInfo::default()
                             .stage(vk::ShaderStageFlags::COMPUTE)
-                            .module(resources.module)
+                            .module(resources.compute_module)
                             .name(&entry_name);
                         let pipeline_info = vk::ComputePipelineCreateInfo::default()
                             .stage(stage_info)
@@ -789,11 +822,11 @@ impl PackExecutor {
             let stages = [
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::VERTEX)
-                    .module(resources.module)
+                    .module(resources.vertex_module)
                     .name(&vertex_entry),
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::FRAGMENT)
-                    .module(resources.module)
+                    .module(resources.fragment_module)
                     .name(&fragment_entry),
             ];
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -1062,7 +1095,9 @@ impl PackExecutor {
             self.command_pool = vk::CommandPool::null();
             for pass in self.passes.drain(..) {
                 device.destroy_pipeline(pass.pipeline, None);
-                device.destroy_shader_module(pass.module, None);
+                device.destroy_shader_module(pass.vertex_module, None);
+                device.destroy_shader_module(pass.fragment_module, None);
+                device.destroy_shader_module(pass.compute_module, None);
                 device.destroy_framebuffer(pass.framebuffer, None);
                 device.destroy_render_pass(pass.render_pass, None);
                 device.destroy_pipeline_layout(pass.pipeline_layout, None);

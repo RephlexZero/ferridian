@@ -10,20 +10,27 @@ use std::path::Path;
 use ferridian_pack_compiler::SlangCompiler;
 use ferridian_testkit::{RenderSpec, ShaderSpec, TestGpu, require_gpu};
 
-fn compile_fixture(name: &str) -> Vec<u32> {
+/// Compile a fixture's `vs_main`/`fs_main` entries to their own modules —
+/// never one module mixing both, which GPU-assisted validation can't
+/// instrument.
+fn compile_fixture(name: &str) -> (Vec<u32>, Vec<u32>) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{name}.slang"));
     let compiler = SlangCompiler::from_environment()
         .expect("GPU tests need slangc: the container sets FERRIDIAN_SLANGC");
-    compiler
-        .compile_to_spirv(&source, name)
-        .unwrap_or_else(|error| panic!("compiling fixture {name}: {error}"))
+    let vertex = compiler
+        .compile_stage(&source, name, "vs_main", "vertex")
+        .unwrap_or_else(|error| panic!("compiling fixture {name} vertex stage: {error}"));
+    let fragment = compiler
+        .compile_stage(&source, name, "fs_main", "fragment")
+        .unwrap_or_else(|error| panic!("compiling fixture {name} fragment stage: {error}"));
+    (vertex, fragment)
 }
 
 #[test]
 fn gradient_matches_golden() {
     require_gpu!();
     let mut gpu = TestGpu::new();
-    let spirv = compile_fixture("gradient");
+    let (vertex_spirv, fragment_spirv) = compile_fixture("gradient");
     let image = ferridian_testkit::render_offscreen(
         gpu.runtime(),
         &RenderSpec {
@@ -32,8 +39,9 @@ fn gradient_matches_golden() {
             clear_color: [0.0, 0.0, 0.0, 1.0],
             vertex_count: 3,
             shader: ShaderSpec {
-                spirv: &spirv,
+                vertex_spirv: &vertex_spirv,
                 vertex_entry: "vs_main",
+                fragment_spirv: &fragment_spirv,
                 fragment_entry: "fs_main",
             },
             pass_label: None,
@@ -48,7 +56,7 @@ fn gradient_matches_golden() {
 fn clear_color_reaches_readback() {
     require_gpu!();
     let mut gpu = TestGpu::new();
-    let spirv = compile_fixture("gradient");
+    let (vertex_spirv, fragment_spirv) = compile_fixture("gradient");
     // Zero vertices: nothing is drawn, so every pixel is the clear color —
     // a golden-free sanity check that the readback path reports what the GPU
     // actually did (guards against blessing garbage).
@@ -60,8 +68,9 @@ fn clear_color_reaches_readback() {
             clear_color: [1.0, 0.0, 0.0, 1.0],
             vertex_count: 0,
             shader: ShaderSpec {
-                spirv: &spirv,
+                vertex_spirv: &vertex_spirv,
                 vertex_entry: "vs_main",
+                fragment_spirv: &fragment_spirv,
                 fragment_entry: "fs_main",
             },
             pass_label: None,

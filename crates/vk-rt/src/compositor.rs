@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use ferridian_contract::CameraUniforms;
 use ferridian_engine::exec::{ExecutionPlan, WireError, plan_execution};
-use ferridian_engine::pack::LoadedPack;
+use ferridian_engine::pack::{LoadedPack, PassModules};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 
@@ -65,7 +65,7 @@ pub struct PackCompositor {
     queue_family_index: u32,
     allocator: Arc<Mutex<Allocator>>,
     plan: ExecutionPlan,
-    modules: BTreeMap<String, Vec<u32>>,
+    modules: BTreeMap<String, PassModules>,
     built: Option<Built>,
     /// Building failed once — stay off rather than failing every frame.
     disabled: bool,

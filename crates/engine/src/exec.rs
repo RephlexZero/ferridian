@@ -21,7 +21,7 @@ use ferridian_pack_format::{
 };
 
 use crate::ResourceId;
-use crate::pack::LoadedPack;
+use crate::pack::{LoadedPack, PassModules};
 
 /// The final render target every executable pack must write.
 pub const SWAPCHAIN: &str = "swapchain";
@@ -182,17 +182,46 @@ pub struct ExecutionPlan {
     pub external_inputs: Vec<ResourceId>,
 }
 
-/// Reflect every module of a loaded pack and wire it for execution.
+/// Reflect every module of a loaded pack and wire it for execution. Each
+/// pass's stage modules are reflected separately (they're compiled and
+/// shipped as isolated single-entry-point `VkShaderModule`s) and merged into
+/// one [`ShaderReflection`] — the same shape the wiring rules below have
+/// always assumed a pass's module carries.
 pub fn plan_execution(pack: &LoadedPack) -> Result<ExecutionPlan, WireError> {
     let mut reflections = BTreeMap::new();
-    for (name, words) in &pack.modules {
-        let reflection = reflect_spirv(words).map_err(|message| WireError::Reflection {
-            pass: name.clone(),
-            message,
-        })?;
+    for (name, modules) in &pack.modules {
+        let reflect = |words: &[u32]| {
+            reflect_spirv(words).map_err(|message| WireError::Reflection {
+                pass: name.clone(),
+                message,
+            })
+        };
+        let reflection = match modules {
+            PassModules::Graphics { vertex, fragment } => {
+                merge_stage_reflections(reflect(vertex)?, reflect(fragment)?)
+            }
+            PassModules::Compute { compute } => reflect(compute)?,
+        };
         reflections.insert(name.clone(), reflection);
     }
     plan_with_reflections(&pack.manifest, &pack.execution_order, &reflections)
+}
+
+/// Combine two stage modules' reflections into the shape wiring expects:
+/// entry points concatenated, bindings unioned (a resource bound identically
+/// in both stages, e.g. the camera block, must not look like a slot clash).
+fn merge_stage_reflections(a: ShaderReflection, b: ShaderReflection) -> ShaderReflection {
+    let mut entry_points = a.entry_points;
+    entry_points.extend(b.entry_points);
+    entry_points.sort();
+    let mut bindings = a.bindings;
+    bindings.extend(b.bindings);
+    bindings.sort();
+    bindings.dedup();
+    ShaderReflection {
+        entry_points,
+        bindings,
+    }
 }
 
 /// Wire a manifest against per-pass reflections. Split out from

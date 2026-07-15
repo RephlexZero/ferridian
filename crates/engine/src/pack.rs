@@ -42,6 +42,21 @@ pub enum ReloadError {
     BadSpirvMagic { pass: String },
 }
 
+/// A pass's SPIR-V, split by shader stage — a module mixing vertex and
+/// fragment (or any two stages) is exactly the shape GPU-assisted validation
+/// can't instrument, so the artifact never ships one; `packc build` compiles
+/// each stage to its own module (`ferridian_pack_compiler::compile_pack`).
+#[derive(Debug, Clone)]
+pub enum PassModules {
+    Graphics {
+        vertex: Vec<u32>,
+        fragment: Vec<u32>,
+    },
+    Compute {
+        compute: Vec<u32>,
+    },
+}
+
 /// A fully loaded pack artifact, ready to hand to the render graph.
 #[derive(Debug)]
 pub struct LoadedPack {
@@ -51,8 +66,8 @@ pub struct LoadedPack {
     /// Indices into `manifest.passes` in execution order (writers before
     /// readers) — re-derived from the graph, not manifest declaration order.
     pub execution_order: Vec<usize>,
-    /// SPIR-V words per pass name.
-    pub modules: BTreeMap<String, Vec<u32>>,
+    /// Stage modules per pass name.
+    pub modules: BTreeMap<String, PassModules>,
 }
 
 /// Build the engine pass graph from a validated manifest.
@@ -110,12 +125,21 @@ pub fn load_pack(out_dir: &Path, generation: u64) -> Result<LoadedPack, ReloadEr
 
     let mut modules = BTreeMap::new();
     for pass in &manifest.passes {
-        let spv_path = out_dir.join(format!("{}.spv", pass.name));
-        let bytes = fs::read(&spv_path).map_err(|e| io_err(&spv_path, e))?;
-        modules.insert(
-            pass.name.clone(),
-            words_from_spirv_bytes(&pass.name, &bytes)?,
-        );
+        let read_stage = |stage: &str| -> Result<Vec<u32>, ReloadError> {
+            let spv_path = out_dir.join(format!("{}.{stage}.spv", pass.name));
+            let bytes = fs::read(&spv_path).map_err(|e| io_err(&spv_path, e))?;
+            words_from_spirv_bytes(&pass.name, &bytes)
+        };
+        let pass_modules = match pass.kind {
+            ManifestPassKind::Graphics => PassModules::Graphics {
+                vertex: read_stage("vertex")?,
+                fragment: read_stage("fragment")?,
+            },
+            ManifestPassKind::Compute => PassModules::Compute {
+                compute: read_stage("compute")?,
+            },
+        };
+        modules.insert(pass.name.clone(), pass_modules);
     }
     Ok(LoadedPack {
         generation,

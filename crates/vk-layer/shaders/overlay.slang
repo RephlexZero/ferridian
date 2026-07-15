@@ -3,9 +3,11 @@
 // Deliberately unmistakable against any plausible game output; zero bindings
 // so no descriptor state can clash with the host application's.
 //
-// The committed `overlay.spv` next to this file is what the layer embeds
-// (a layer inside a game process has no slangc); the `overlay_spv_is_current`
-// test keeps the two in sync.
+// The committed `overlay.vertex.spv`/`overlay.fragment.spv` next to this file
+// are what the layer embeds (a layer inside a game process has no slangc,
+// and a module mixing both entry points is exactly what GPU-assisted
+// validation can't instrument); `committed_overlay_spv_matches_pinned_slangc_output`
+// keeps them in sync.
 
 struct VsOut
 {

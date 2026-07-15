@@ -103,9 +103,14 @@ fn render_gradient(runtime: &VkRuntime, pass_label: Option<&str>) -> ferridian_t
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testkit/fixtures/gradient.slang");
     let compiler = ferridian_pack_compiler::SlangCompiler::from_environment()
         .expect("GPU tests need slangc: the container sets FERRIDIAN_SLANGC");
-    let spirv = compiler
-        .compile_to_spirv(&fixture, "gradient")
-        .expect("compile gradient fixture");
+    // Two modules, never one mixing both entry points — that's exactly the
+    // shape GPU-assisted validation can't instrument.
+    let vertex_spirv = compiler
+        .compile_stage(&fixture, "gradient", "vs_main", "vertex")
+        .expect("compile gradient fixture vertex stage");
+    let fragment_spirv = compiler
+        .compile_stage(&fixture, "gradient", "fs_main", "fragment")
+        .expect("compile gradient fixture fragment stage");
     let image = ferridian_testkit::render_offscreen(
         runtime,
         &RenderSpec {
@@ -114,8 +119,9 @@ fn render_gradient(runtime: &VkRuntime, pass_label: Option<&str>) -> ferridian_t
             clear_color: [0.0, 0.0, 0.0, 1.0],
             vertex_count: 3,
             shader: ShaderSpec {
-                spirv: &spirv,
+                vertex_spirv: &vertex_spirv,
                 vertex_entry: "vs_main",
+                fragment_spirv: &fragment_spirv,
                 fragment_entry: "fs_main",
             },
             pass_label,

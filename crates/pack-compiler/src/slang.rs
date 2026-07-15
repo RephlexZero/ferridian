@@ -44,14 +44,36 @@ impl SlangCompiler {
         Ok(SlangCompiler::new(resolve_slangc(None)?))
     }
 
-    /// Compile one Slang source file to a SPIR-V module (all entry points).
+    /// Compile one Slang source file to a SPIR-V module containing every
+    /// entry point it declares. Used only to *discover* what's in a pass's
+    /// source (see [`SlangCompiler::compile_stage`] for what actually ships)
+    /// — a module mixing vertex and fragment entry points is exactly the
+    /// shape GPU-assisted validation can't instrument.
     pub fn compile_to_spirv(&self, source: &Path, pass: &str) -> Result<Vec<u32>, CompileError> {
+        self.invoke(source, pass, &[])
+    }
+
+    /// Compile a single named entry point of `source` to its own SPIR-V
+    /// module — the shape every pack artifact actually ships, one
+    /// `VkShaderModule` per stage.
+    pub fn compile_stage(
+        &self,
+        source: &Path,
+        pass: &str,
+        entry: &str,
+        stage: &str,
+    ) -> Result<Vec<u32>, CompileError> {
+        self.invoke(source, pass, &["-entry", entry, "-stage", stage])
+    }
+
+    fn invoke(&self, source: &Path, pass: &str, extra: &[&str]) -> Result<Vec<u32>, CompileError> {
         let out = tempfile_path(pass);
         let output = Command::new(&self.slangc)
             .arg(source)
             .args(["-target", "spirv"])
             .args(["-profile", "spirv_1_5"])
             .arg("-fvk-use-entrypoint-name")
+            .args(extra)
             .arg("-o")
             .arg(&out)
             .output()
@@ -81,6 +103,16 @@ impl SlangCompiler {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect())
+    }
+}
+
+/// Map a reflected SPIR-V execution model name to slangc's `-stage` value.
+pub fn slangc_stage(reflected_stage: &str) -> Option<&'static str> {
+    match reflected_stage {
+        "Vertex" => Some("vertex"),
+        "Fragment" => Some("fragment"),
+        "GLCompute" => Some("compute"),
+        _ => None,
     }
 }
 

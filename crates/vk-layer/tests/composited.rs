@@ -111,7 +111,12 @@ fn boot_layered_runtime() -> VkRuntime {
 
 /// Render the synthetic game scene (color split + depth plateaus) through
 /// the layered chain, optionally inside a labelled debug group.
-fn render_scene(runtime: &VkRuntime, spirv: &[u32], pass_label: Option<&str>) -> RgbaImage {
+fn render_scene(
+    runtime: &VkRuntime,
+    vertex_spirv: &[u32],
+    fragment_spirv: &[u32],
+    pass_label: Option<&str>,
+) -> RgbaImage {
     ferridian_testkit::render_offscreen_with_depth(
         runtime,
         &RenderSpec {
@@ -120,8 +125,9 @@ fn render_scene(runtime: &VkRuntime, spirv: &[u32], pass_label: Option<&str>) ->
             clear_color: [0.0, 0.0, 0.0, 1.0],
             vertex_count: 3,
             shader: ShaderSpec {
-                spirv,
+                vertex_spirv,
                 vertex_entry: "vs_main",
+                fragment_spirv,
                 fragment_entry: "fs_main",
             },
             pass_label,
@@ -198,22 +204,42 @@ fn layer_runs_the_reference_pack_over_the_intercepted_frame() {
     let compiler =
         SlangCompiler::from_environment().expect("GPU tests need slangc (FERRIDIAN_SLANGC)");
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testkit/fixtures/scene.slang");
-    let scene_spirv = compiler
-        .compile_to_spirv(&fixture, "scene")
-        .expect("compile scene fixture");
+    // Two modules, never one mixing both entry points — that's exactly the
+    // shape GPU-assisted validation can't instrument.
+    let scene_vertex_spirv = compiler
+        .compile_stage(&fixture, "scene", "vs_main", "vertex")
+        .expect("compile scene fixture vertex stage");
+    let scene_fragment_spirv = compiler
+        .compile_stage(&fixture, "scene", "fs_main", "fragment")
+        .expect("compile scene fixture fragment stage");
 
     let runtime = boot_layered_runtime();
 
     // The world-final pass triggers the pack. Twice: the app destroys and
     // recreates its attachments between frames (as a swapchain resize
     // would), so the second run exercises invalidation + rebuild.
-    let composited = render_scene(&runtime, &scene_spirv, Some(&translucent));
-    let composited_again = render_scene(&runtime, &scene_spirv, Some(&translucent));
+    let composited = render_scene(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        Some(&translucent),
+    );
+    let composited_again = render_scene(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        Some(&translucent),
+    );
     // A classified pass that is not the world-final one must not trigger —
     // and with a pack armed, the embedded overlay stays out of it too.
-    let terrain_pass = render_scene(&runtime, &scene_spirv, Some(&terrain));
+    let terrain_pass = render_scene(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        Some(&terrain),
+    );
     // An Unknown pass is forwarded untouched, always.
-    let unlabeled = render_scene(&runtime, &scene_spirv, None);
+    let unlabeled = render_scene(&runtime, &scene_vertex_spirv, &scene_fragment_spirv, None);
 
     assert_eq!(
         composited, composited_again,

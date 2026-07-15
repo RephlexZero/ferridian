@@ -126,7 +126,12 @@ fn boot_layered_runtime() -> VkRuntime {
 
 /// Render the synthetic game scene (color split + depth plateaus) through
 /// the layered chain inside the world-final debug group.
-fn render_frame(runtime: &VkRuntime, spirv: &[u32], pass_label: &str) -> RgbaImage {
+fn render_frame(
+    runtime: &VkRuntime,
+    vertex_spirv: &[u32],
+    fragment_spirv: &[u32],
+    pass_label: &str,
+) -> RgbaImage {
     ferridian_testkit::render_offscreen_with_depth(
         runtime,
         &RenderSpec {
@@ -135,8 +140,9 @@ fn render_frame(runtime: &VkRuntime, spirv: &[u32], pass_label: &str) -> RgbaIma
             clear_color: [0.0, 0.0, 0.0, 1.0],
             vertex_count: 3,
             shader: ShaderSpec {
-                spirv,
+                vertex_spirv,
                 vertex_entry: "vs_main",
+                fragment_spirv,
                 fragment_entry: "fs_main",
             },
             pass_label: Some(pass_label),
@@ -168,12 +174,22 @@ fn layer_hot_swaps_the_pack_when_a_new_generation_is_published() {
         .game_anchor
         .clone();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testkit/fixtures/scene.slang");
-    let scene_spirv = compiler
-        .compile_to_spirv(&fixture, "scene")
-        .expect("compile scene fixture");
+    // Two modules, never one mixing both entry points — that's exactly the
+    // shape GPU-assisted validation can't instrument.
+    let scene_vertex_spirv = compiler
+        .compile_stage(&fixture, "scene", "vs_main", "vertex")
+        .expect("compile scene fixture vertex stage");
+    let scene_fragment_spirv = compiler
+        .compile_stage(&fixture, "scene", "fs_main", "fragment")
+        .expect("compile scene fixture fragment stage");
 
     let runtime = boot_layered_runtime();
-    let v1 = render_frame(&runtime, &scene_spirv, &translucent);
+    let v1 = render_frame(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        &translucent,
+    );
 
     // The author edit: generation 2 inverts the composite. Files first, then
     // the atomic generation bump — the exact packc-serve handshake.
@@ -182,8 +198,18 @@ fn layer_hot_swaps_the_pack_when_a_new_generation_is_published() {
     write_artifact(&artifact, &out).expect("write edited artifact");
     write_generation(&out, 2).expect("publish generation 2");
 
-    let v2 = render_frame(&runtime, &scene_spirv, &translucent);
-    let v2_again = render_frame(&runtime, &scene_spirv, &translucent);
+    let v2 = render_frame(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        &translucent,
+    );
+    let v2_again = render_frame(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        &translucent,
+    );
     assert_eq!(
         v2, v2_again,
         "the swapped-in pack must be deterministic across frames"
@@ -210,9 +236,14 @@ fn layer_hot_swaps_the_pack_when_a_new_generation_is_published() {
     // Generation 3 is corrupt on disk: the reload must fail loudly in the
     // logs but keep generation 2 compositing — a broken publish never takes
     // the running pack (or the game) down.
-    fs::write(out.join("composite.spv"), b"not spir-v").expect("corrupt module");
+    fs::write(out.join("composite.fragment.spv"), b"not spir-v").expect("corrupt module");
     write_generation(&out, 3).expect("publish generation 3");
-    let v3 = render_frame(&runtime, &scene_spirv, &translucent);
+    let v3 = render_frame(
+        &runtime,
+        &scene_vertex_spirv,
+        &scene_fragment_spirv,
+        &translucent,
+    );
     assert_eq!(
         v3, v2,
         "a reload that fails to load must keep the previous compositor running"

@@ -14,11 +14,14 @@ use ferridian_vk_rt::VkRuntime;
 
 use crate::image::RgbaImage;
 
-/// A compiled shader module holding both stages of a draw.
+/// The two stage modules of a draw — never one module mixing both entry
+/// points (that's exactly the shape GPU-assisted validation can't
+/// instrument), so callers compile each stage to its own SPIR-V (e.g. via
+/// `SlangCompiler::compile_stage`).
 pub struct ShaderSpec<'a> {
-    /// SPIR-V words containing both entry points (one slangc module).
-    pub spirv: &'a [u32],
+    pub vertex_spirv: &'a [u32],
     pub vertex_entry: &'a str,
+    pub fragment_spirv: &'a [u32],
     pub fragment_entry: &'a str,
 }
 
@@ -240,22 +243,28 @@ fn render_scene(runtime: &VkRuntime, spec: &RenderSpec<'_>, with_depth: bool) ->
             .create_framebuffer(&framebuffer_info, None)
             .expect("create framebuffer");
 
-        // Pipeline.
-        let module_info = vk::ShaderModuleCreateInfo::default().code(spec.shader.spirv);
-        let module = device
-            .create_shader_module(&module_info, None)
-            .expect("create shader module");
+        // Pipeline: one module per stage.
+        let vertex_module_info =
+            vk::ShaderModuleCreateInfo::default().code(spec.shader.vertex_spirv);
+        let vertex_module = device
+            .create_shader_module(&vertex_module_info, None)
+            .expect("create vertex shader module");
+        let fragment_module_info =
+            vk::ShaderModuleCreateInfo::default().code(spec.shader.fragment_spirv);
+        let fragment_module = device
+            .create_shader_module(&fragment_module_info, None)
+            .expect("create fragment shader module");
         let vertex_entry = CString::new(spec.shader.vertex_entry).expect("vertex entry point name");
         let fragment_entry =
             CString::new(spec.shader.fragment_entry).expect("fragment entry point name");
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
+                .module(vertex_module)
                 .name(&vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
+                .module(fragment_module)
                 .name(&fragment_entry),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -457,7 +466,8 @@ fn render_scene(runtime: &VkRuntime, spec: &RenderSpec<'_>, with_depth: bool) ->
         device.free_memory(buffer_memory, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
-        device.destroy_shader_module(module, None);
+        device.destroy_shader_module(vertex_module, None);
+        device.destroy_shader_module(fragment_module, None);
         device.destroy_framebuffer(framebuffer, None);
         device.destroy_render_pass(render_pass, None);
         if let Some((depth_image, depth_memory, depth_view)) = depth {
