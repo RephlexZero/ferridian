@@ -40,8 +40,28 @@ pub enum WireError {
     Reflection { pass: String, message: String },
     #[error("pass {pass}: no reflection supplied")]
     MissingReflection { pass: String },
-    #[error("pass {pass}: compute passes are not executable yet")]
-    ComputeUnsupported { pass: String },
+    #[error(
+        "pass {pass}: compute passes cannot write {SWAPCHAIN:?} (the game's image lacks storage usage); write an intermediate and composite it with a graphics pass"
+    )]
+    ComputeSwapchainWrite { pass: String },
+    #[error(
+        "pass {pass}: compute entry point declares no workgroup size (OpExecutionMode LocalSize)"
+    )]
+    MissingWorkgroupSize { pass: String },
+    #[error("pass {pass}: never binds its output {resource:?} as a storage image")]
+    ComputeOutputUnbound { pass: String, resource: String },
+    #[error(
+        "pass {pass}: binds storage image {name:?}, but only its output {output:?} is writable"
+    )]
+    StorageImageNotOutput {
+        pass: String,
+        name: String,
+        output: String,
+    },
+    #[error("pass {pass}: binds storage image {name:?}; graphics passes write through attachments")]
+    StorageImageOutsideCompute { pass: String, name: String },
+    #[error("pass {pass}: binds its output as a storage image twice")]
+    DuplicateOutputBinding { pass: String },
     #[error("pass {pass}: declares {count} outputs; execution supports exactly one")]
     OutputCount { pass: String, count: usize },
     #[error("pass {pass}: writes {resource:?}, a builtin the game owns")]
@@ -94,18 +114,36 @@ pub struct BindingPlan {
     pub resource: ResourceId,
 }
 
-/// Everything the executor needs to run one graphics pass: entry points,
-/// wired descriptors, and the single color target it writes.
+/// How a pass runs on the device: a fullscreen-triangle graphics pipeline or
+/// a compute dispatch covering the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagePlan {
+    Graphics {
+        vertex_entry: String,
+        fragment_entry: String,
+    },
+    Compute {
+        entry: String,
+        /// `OpExecutionMode LocalSize` — the executor dispatches
+        /// `ceil(extent / workgroup_size)` groups.
+        workgroup_size: [u32; 3],
+    },
+}
+
+/// Everything the executor needs to run one pass: entry points, wired
+/// descriptors, and the single target it writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassPlan {
     pub name: String,
-    pub vertex_entry: String,
-    pub fragment_entry: String,
-    /// Sorted by binding slot.
+    pub stage: StagePlan,
+    /// Sampled inputs, sorted by binding slot.
     pub bindings: Vec<BindingPlan>,
     /// Descriptor slot of the [`CAMERA`] uniform block, when the pass binds
-    /// it. Never collides with a sampler slot in `bindings`.
+    /// it. Never collides with any other slot of the pass.
     pub camera_binding: Option<u32>,
+    /// Compute only: the descriptor slot where `output` is bound as a
+    /// storage image (graphics passes write through the attachment instead).
+    pub output_binding: Option<u32>,
     pub output: ResourceId,
 }
 
@@ -149,9 +187,7 @@ pub fn plan_with_reflections(
     for &index in execution_order {
         let pass = &manifest.passes[index];
         let err_pass = || pass.name.clone();
-        if pass.kind != ManifestPassKind::Graphics {
-            return Err(WireError::ComputeUnsupported { pass: err_pass() });
-        }
+        let is_compute = pass.kind == ManifestPassKind::Compute;
         if pass.inputs.iter().any(|input| input == SWAPCHAIN) {
             return Err(WireError::SwapchainRead { pass: err_pass() });
         }
@@ -163,6 +199,9 @@ pub fn plan_with_reflections(
         }
         let output = pass.outputs[0].as_str();
         if output == SWAPCHAIN {
+            if is_compute {
+                return Err(WireError::ComputeSwapchainWrite { pass: err_pass() });
+            }
             writes_swapchain = true;
         } else if EXTERNAL_INPUTS.contains(&output) {
             return Err(WireError::WritesReadOnlyBuiltin {
@@ -176,11 +215,30 @@ pub fn plan_with_reflections(
         let reflection = reflections
             .get(&pass.name)
             .ok_or_else(|| WireError::MissingReflection { pass: err_pass() })?;
-        let vertex_entry = single_stage_entry(reflection, "Vertex", &pass.name)?;
-        let fragment_entry = single_stage_entry(reflection, "Fragment", &pass.name)?;
+        let stage = if is_compute {
+            let entry = single_stage_entry(reflection, "GLCompute", &pass.name)?;
+            let workgroup_size = entry
+                .workgroup_size
+                .filter(|size| size.iter().all(|&n| n > 0))
+                .ok_or_else(|| WireError::MissingWorkgroupSize { pass: err_pass() })?;
+            StagePlan::Compute {
+                entry: entry.name.clone(),
+                workgroup_size,
+            }
+        } else {
+            StagePlan::Graphics {
+                vertex_entry: single_stage_entry(reflection, "Vertex", &pass.name)?
+                    .name
+                    .clone(),
+                fragment_entry: single_stage_entry(reflection, "Fragment", &pass.name)?
+                    .name
+                    .clone(),
+            }
+        };
 
         let mut bindings = Vec::with_capacity(reflection.bindings.len());
         let mut camera_binding = None;
+        let mut output_binding = None;
         let mut used_slots = BTreeSet::new();
         let mut bound_inputs = BTreeSet::new();
         for reflected in &reflection.bindings {
@@ -199,6 +257,35 @@ pub fn plan_with_reflections(
                 });
             }
             match reflected.storage_class.as_str() {
+                // A storage image: the only writable binding, and only a
+                // compute pass's declared output may be one — it bypasses
+                // the declared-inputs check below.
+                "UniformConstant" if reflected.storage_image => {
+                    if !is_compute {
+                        return Err(WireError::StorageImageOutsideCompute {
+                            pass: err_pass(),
+                            name: name.to_owned(),
+                        });
+                    }
+                    if name != output {
+                        return Err(WireError::StorageImageNotOutput {
+                            pass: err_pass(),
+                            name: name.to_owned(),
+                            output: output.to_owned(),
+                        });
+                    }
+                    if output_binding.is_some() {
+                        return Err(WireError::DuplicateOutputBinding { pass: err_pass() });
+                    }
+                    if !used_slots.insert(reflected.binding) {
+                        return Err(WireError::DuplicateBindingSlot {
+                            pass: err_pass(),
+                            binding: reflected.binding,
+                        });
+                    }
+                    output_binding = Some(reflected.binding);
+                    continue;
+                }
                 "UniformConstant" => {}
                 // A uniform block: engine state, not a graph resource — only
                 // the contract camera exists, and it bypasses the
@@ -259,14 +346,20 @@ pub fn plan_with_reflections(
                 });
             }
         }
+        if is_compute && output_binding.is_none() {
+            return Err(WireError::ComputeOutputUnbound {
+                pass: err_pass(),
+                resource: output.to_owned(),
+            });
+        }
         bindings.sort_by_key(|binding| binding.binding);
 
         passes.push(PassPlan {
             name: pass.name.clone(),
-            vertex_entry,
-            fragment_entry,
+            stage,
             bindings,
             camera_binding,
+            output_binding,
             output: ResourceId(output.to_owned()),
         });
     }
@@ -281,18 +374,18 @@ pub fn plan_with_reflections(
     })
 }
 
-fn single_stage_entry(
-    reflection: &ShaderReflection,
+fn single_stage_entry<'a>(
+    reflection: &'a ShaderReflection,
     stage: &'static str,
     pass: &str,
-) -> Result<String, WireError> {
+) -> Result<&'a EntryPointReflection, WireError> {
     let matches: Vec<&EntryPointReflection> = reflection
         .entry_points
         .iter()
         .filter(|entry| entry.stage == stage)
         .collect();
     match matches.as_slice() {
-        [only] => Ok(only.name.clone()),
+        [only] => Ok(only),
         _ => Err(WireError::StageEntryPoints {
             pass: pass.to_owned(),
             stage,
@@ -330,12 +423,22 @@ mod tests {
             EntryPointReflection {
                 name: "vs_main".to_owned(),
                 stage: "Vertex".to_owned(),
+                workgroup_size: None,
             },
             EntryPointReflection {
                 name: "fs_main".to_owned(),
                 stage: "Fragment".to_owned(),
+                workgroup_size: None,
             },
         ]
+    }
+
+    fn compute_stage(workgroup_size: Option<[u32; 3]>) -> Vec<EntryPointReflection> {
+        vec![EntryPointReflection {
+            name: "cs_main".to_owned(),
+            stage: "GLCompute".to_owned(),
+            workgroup_size,
+        }]
     }
 
     fn sampler(set: u32, binding: u32, name: &str) -> BindingReflection {
@@ -343,7 +446,15 @@ mod tests {
             set,
             binding,
             storage_class: "UniformConstant".to_owned(),
+            storage_image: false,
             name: Some(name.to_owned()),
+        }
+    }
+
+    fn storage_image(binding: u32, name: &str) -> BindingReflection {
+        BindingReflection {
+            storage_image: true,
+            ..sampler(0, binding, name)
         }
     }
 
@@ -352,6 +463,7 @@ mod tests {
             set: 0,
             binding,
             storage_class: "Uniform".to_owned(),
+            storage_image: false,
             name: Some(name.to_owned()),
         }
     }
@@ -361,6 +473,47 @@ mod tests {
             entry_points: stages(),
             bindings,
         }
+    }
+
+    fn compute_reflection(bindings: Vec<BindingReflection>) -> ShaderReflection {
+        ShaderReflection {
+            entry_points: compute_stage(Some([8, 8, 1])),
+            bindings,
+        }
+    }
+
+    /// The reference pack's shape after the volumetric conversion: graphics,
+    /// then a compute pass writing an intermediate, then graphics composite.
+    fn compute_shaped() -> PackManifest {
+        manifest(
+            "[[pass]]\nname = \"deferred\"\nkind = \"graphics\"\nshader = \"d.slang\"\n\
+             inputs = [\"game_color\"]\noutputs = [\"lit\"]\n\
+             [[pass]]\nname = \"volumetric\"\nkind = \"compute\"\nshader = \"v.slang\"\n\
+             inputs = [\"game_depth\"]\noutputs = [\"fog\"]\n\
+             [[pass]]\nname = \"composite\"\nkind = \"graphics\"\nshader = \"c.slang\"\n\
+             inputs = [\"lit\", \"fog\"]\noutputs = [\"swapchain\"]\n",
+        )
+    }
+
+    fn compute_shaped_reflections() -> BTreeMap<String, ShaderReflection> {
+        BTreeMap::from([
+            (
+                "deferred".to_owned(),
+                reflection(vec![sampler(0, 0, "game_color")]),
+            ),
+            (
+                "volumetric".to_owned(),
+                compute_reflection(vec![
+                    sampler(0, 0, "game_depth"),
+                    storage_image(1, "fog"),
+                    uniform(7, "camera"),
+                ]),
+            ),
+            (
+                "composite".to_owned(),
+                reflection(vec![sampler(0, 0, "lit"), sampler(0, 1, "fog")]),
+            ),
+        ])
     }
 
     fn reference_reflections() -> BTreeMap<String, ShaderReflection> {
@@ -408,8 +561,13 @@ mod tests {
             ]
         );
         let deferred = &plan.passes[1];
-        assert_eq!(deferred.vertex_entry, "vs_main");
-        assert_eq!(deferred.fragment_entry, "fs_main");
+        assert_eq!(
+            deferred.stage,
+            StagePlan::Graphics {
+                vertex_entry: "vs_main".to_owned(),
+                fragment_entry: "fs_main".to_owned(),
+            }
+        );
         assert_eq!(
             deferred
                 .bindings
@@ -596,6 +754,7 @@ mod tests {
                 entry_points: vec![EntryPointReflection {
                     name: "vs_main".to_owned(),
                     stage: "Vertex".to_owned(),
+                    workgroup_size: None,
                 }],
                 bindings: vec![sampler(0, 0, "lit")],
             },
@@ -611,19 +770,141 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unexecutable_manifest_shapes() {
-        // Compute pass.
-        let compute = manifest(
+    fn wires_a_compute_pass_mid_graph() {
+        let plan = plan(&compute_shaped(), &compute_shaped_reflections()).unwrap();
+        let volumetric = &plan.passes[1];
+        assert_eq!(
+            volumetric.stage,
+            StagePlan::Compute {
+                entry: "cs_main".to_owned(),
+                workgroup_size: [8, 8, 1],
+            }
+        );
+        // The storage-image output and the camera are wired by slot, not as
+        // sampled inputs.
+        assert_eq!(volumetric.output_binding, Some(1));
+        assert_eq!(volumetric.camera_binding, Some(7));
+        assert_eq!(
+            volumetric
+                .bindings
+                .iter()
+                .map(|b| (b.binding, b.resource.0.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "game_depth")]
+        );
+        // Graphics passes never carry an output binding.
+        assert_eq!(plan.passes[0].output_binding, None);
+        assert_eq!(
+            plan.external_inputs
+                .iter()
+                .map(|resource| resource.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["game_color", "game_depth"]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_compute_passes() {
+        // Writing the swapchain from compute.
+        let to_swapchain = manifest(
             "[[pass]]\nname = \"lighting\"\nkind = \"compute\"\nshader = \"l.slang\"\n\
              inputs = [\"game_color\"]\noutputs = [\"swapchain\"]\n",
         );
         assert_eq!(
-            plan(&compute, &BTreeMap::new()),
-            Err(WireError::ComputeUnsupported {
+            plan(&to_swapchain, &BTreeMap::new()),
+            Err(WireError::ComputeSwapchainWrite {
                 pass: "lighting".to_owned(),
             })
         );
 
+        // No workgroup size on the compute entry.
+        let mut reflections = compute_shaped_reflections();
+        reflections.insert(
+            "volumetric".to_owned(),
+            ShaderReflection {
+                entry_points: compute_stage(None),
+                bindings: vec![sampler(0, 0, "game_depth"), storage_image(1, "fog")],
+            },
+        );
+        assert_eq!(
+            plan(&compute_shaped(), &reflections),
+            Err(WireError::MissingWorkgroupSize {
+                pass: "volumetric".to_owned(),
+            })
+        );
+
+        // The output never bound as a storage image.
+        let mut reflections = compute_shaped_reflections();
+        reflections.insert(
+            "volumetric".to_owned(),
+            compute_reflection(vec![sampler(0, 0, "game_depth")]),
+        );
+        assert_eq!(
+            plan(&compute_shaped(), &reflections),
+            Err(WireError::ComputeOutputUnbound {
+                pass: "volumetric".to_owned(),
+                resource: "fog".to_owned(),
+            })
+        );
+
+        // A storage image that is not the declared output.
+        let mut reflections = compute_shaped_reflections();
+        reflections.insert(
+            "volumetric".to_owned(),
+            compute_reflection(vec![
+                sampler(0, 0, "game_depth"),
+                storage_image(1, "fog"),
+                storage_image(2, "scratch"),
+            ]),
+        );
+        assert_eq!(
+            plan(&compute_shaped(), &reflections),
+            Err(WireError::StorageImageNotOutput {
+                pass: "volumetric".to_owned(),
+                name: "scratch".to_owned(),
+                output: "fog".to_owned(),
+            })
+        );
+
+        // The output bound as a storage image twice.
+        let mut reflections = compute_shaped_reflections();
+        reflections.insert(
+            "volumetric".to_owned(),
+            compute_reflection(vec![
+                sampler(0, 0, "game_depth"),
+                storage_image(1, "fog"),
+                storage_image(2, "fog"),
+            ]),
+        );
+        assert_eq!(
+            plan(&compute_shaped(), &reflections),
+            Err(WireError::DuplicateOutputBinding {
+                pass: "volumetric".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_storage_images_in_graphics_passes() {
+        let mut reflections = reference_reflections();
+        reflections.insert(
+            "shadows".to_owned(),
+            reflection(vec![
+                sampler(0, 0, "game_depth"),
+                storage_image(1, "shadow_mask"),
+            ]),
+        );
+        assert_eq!(
+            plan(&reference_shaped(), &reflections),
+            Err(WireError::StorageImageOutsideCompute {
+                pass: "shadows".to_owned(),
+                name: "shadow_mask".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unexecutable_manifest_shapes() {
         // Nothing writes the swapchain.
         let headless = manifest(
             "[[pass]]\nname = \"shadows\"\nkind = \"graphics\"\nshader = \"s.slang\"\n\
