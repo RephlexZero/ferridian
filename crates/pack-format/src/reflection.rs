@@ -32,6 +32,12 @@ pub struct EntryPointReflection {
     /// walker deliberately doesn't do — the planner rejects that as missing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workgroup_size: Option<[u32; 3]>,
+    /// `Location` decorations of the entry point's `Output`-class interface
+    /// variables, sorted. For a fragment entry these are its color-attachment
+    /// writes — the planner checks them against the pass's declared outputs.
+    /// (Builtins like `SV_Position` carry no location and don't appear.)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_locations: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -72,9 +78,11 @@ pub fn reflect_spirv(words: &[u32]) -> Result<ShaderReflection, String> {
     let mut storage_classes: BTreeMap<Word, u32> = BTreeMap::new();
     let mut sets: BTreeMap<Word, u32> = BTreeMap::new();
     let mut binding_slots: BTreeMap<Word, u32> = BTreeMap::new();
-    // (entry point id, name, stage) — workgroup sizes attach after the walk,
-    // since OpExecutionMode references the id.
-    let mut entry_points: Vec<(Word, String, String)> = Vec::new();
+    let mut locations: BTreeMap<Word, u32> = BTreeMap::new();
+    // (entry point id, name, stage, interface ids) — workgroup sizes attach
+    // after the walk, since OpExecutionMode references the id; the interface
+    // resolves to output locations once every OpVariable has been seen.
+    let mut entry_points: Vec<(Word, String, String, Vec<Word>)> = Vec::new();
     let mut workgroup_sizes: BTreeMap<Word, [u32; 3]> = BTreeMap::new();
     // Type graph for storage-image detection: variable -> pointer type ->
     // pointee type -> OpTypeImage's Sampled literal.
@@ -104,10 +112,17 @@ pub fn reflect_spirv(words: &[u32]) -> Result<ShaderReflection, String> {
             }
             let name = decode_string(&operands[2..])
                 .ok_or_else(|| format!("OpEntryPoint at word {offset} has an unterminated name"))?;
+            // The interface ids start after the name's NUL-terminated words.
+            let name_words = operands[2..]
+                .iter()
+                .position(|word| word.to_le_bytes().contains(&0))
+                .map(|index| index + 1)
+                .unwrap_or(operands.len() - 2);
             entry_points.push((
                 operands[1],
                 name,
                 enum_name(ExecutionModel::from_u32(operands[0]), operands[0]),
+                operands[2 + name_words..].to_vec(),
             ));
         } else if opcode == Op::ExecutionMode as u32 {
             // [entry point id, mode, literals…] — LocalSize carries x, y, z.
@@ -128,6 +143,8 @@ pub fn reflect_spirv(words: &[u32]) -> Result<ShaderReflection, String> {
                     sets.insert(operands[0], operands[2]);
                 } else if operands[1] == Decoration::Binding as u32 {
                     binding_slots.insert(operands[0], operands[2]);
+                } else if operands[1] == Decoration::Location as u32 {
+                    locations.insert(operands[0], operands[2]);
                 }
             }
         } else if opcode == Op::Variable as u32 {
@@ -154,10 +171,19 @@ pub fn reflect_spirv(words: &[u32]) -> Result<ShaderReflection, String> {
 
     let mut entry_points: Vec<EntryPointReflection> = entry_points
         .into_iter()
-        .map(|(id, name, stage)| EntryPointReflection {
-            name,
-            stage,
-            workgroup_size: workgroup_sizes.get(&id).copied(),
+        .map(|(id, name, stage, interface)| {
+            let mut output_locations: Vec<u32> = interface
+                .iter()
+                .filter(|id| storage_classes.get(id) == Some(&(StorageClass::Output as u32)))
+                .filter_map(|id| locations.get(id).copied())
+                .collect();
+            output_locations.sort_unstable();
+            EntryPointReflection {
+                name,
+                stage,
+                workgroup_size: workgroup_sizes.get(&id).copied(),
+                output_locations,
+            }
         })
         .collect();
     entry_points.sort();
@@ -302,6 +328,7 @@ mod tests {
                 name: "cs_main".to_owned(),
                 stage: "GLCompute".to_owned(),
                 workgroup_size: Some([8, 8, 1]),
+                output_locations: vec![],
             }]
         );
         assert_eq!(
@@ -333,6 +360,30 @@ mod tests {
             reflect_spirv(&module(&[inst(Op::EntryPoint, &entry)])).expect("module reflects");
         assert_eq!(reflection.entry_points.len(), 1);
         assert_eq!(reflection.entry_points[0].workgroup_size, None);
+    }
+
+    /// A fragment entry writing two color outputs (locations 1 and 0, listed
+    /// out of order) plus a location-decorated *input* and the un-located
+    /// position builtin — only the outputs' locations must surface, sorted.
+    #[test]
+    fn reflects_fragment_output_locations() {
+        let mut entry = vec![ExecutionModel::Fragment as u32, 1];
+        entry.extend(string_words("fs_main"));
+        // Interface: %30 input, %31/%32 outputs, %33 builtin-like (no
+        // location decoration).
+        entry.extend([30, 31, 32, 33]);
+        let reflection = reflect_spirv(&module(&[
+            inst(Op::EntryPoint, &entry),
+            inst(Op::Decorate, &[30, Decoration::Location as u32, 0]),
+            inst(Op::Decorate, &[31, Decoration::Location as u32, 1]),
+            inst(Op::Decorate, &[32, Decoration::Location as u32, 0]),
+            inst(Op::Variable, &[9, 30, StorageClass::Input as u32]),
+            inst(Op::Variable, &[9, 31, StorageClass::Output as u32]),
+            inst(Op::Variable, &[9, 32, StorageClass::Output as u32]),
+            inst(Op::Variable, &[9, 33, StorageClass::Output as u32]),
+        ]))
+        .expect("module reflects");
+        assert_eq!(reflection.entry_points[0].output_locations, vec![0, 1]);
     }
 
     #[test]

@@ -5,6 +5,7 @@ expression: reflection
 [[entry_points]]
 name = 'fs_main'
 stage = 'Fragment'
+output_locations = [0]
 
 [[bindings]]
 set = 0

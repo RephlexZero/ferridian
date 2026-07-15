@@ -30,6 +30,18 @@ fn assemble_test_module() -> Vec<u32> {
     );
     b.name(scene_uniforms, "scene_uniforms");
 
+    // A color output at location 0 — the attachment writes the planner
+    // checks against a pass's declared outputs.
+    let vec4 = b.type_vector(float, 4);
+    let out_ptr = b.type_pointer(None, spirv::StorageClass::Output, vec4);
+    let frag_color = b.variable(out_ptr, None, spirv::StorageClass::Output, None);
+    b.decorate(
+        frag_color,
+        spirv::Decoration::Location,
+        [Operand::LiteralBit32(0)],
+    );
+    b.name(frag_color, "frag_color");
+
     let void = b.type_void();
     let void_fn = b.type_function(void, []);
     let main_fn = b
@@ -38,7 +50,12 @@ fn assemble_test_module() -> Vec<u32> {
     b.begin_block(None).unwrap();
     b.ret().unwrap();
     b.end_function().unwrap();
-    b.entry_point(spirv::ExecutionModel::Fragment, main_fn, "fs_main", []);
+    b.entry_point(
+        spirv::ExecutionModel::Fragment,
+        main_fn,
+        "fs_main",
+        [frag_color],
+    );
     b.execution_mode(main_fn, spirv::ExecutionMode::OriginUpperLeft, []);
 
     b.module().assemble()
