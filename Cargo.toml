@@ -46,20 +46,20 @@ ferridian-engine = { path = "crates/engine" }
 ferridian-pack-compiler = { path = "crates/pack-compiler" }
 ferridian-pack-format = { path = "crates/pack-format" }
 ferridian-vk-rt = { path = "crates/vk-rt" }
-gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
 ferridian-testkit = { path = "crates/testkit" }
 insta = { version = "1.42", features = ["toml"] }
-libloading = "0.8"
-png = "0.17"
-rspirv = "0.12"
+libloading = "0.9"
+png = "0.18"
+rspirv = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1_smol = "1.0"
 thiserror = "2.0"
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
-ureq = { version = "2.12", features = ["json"] }
-zip = { version = "4", default-features = false, features = ["deflate"] }
+ureq = { version = "3.3", features = ["json"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [profile.dev]
 debug = 1
