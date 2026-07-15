@@ -169,9 +169,31 @@ pub enum ContractError {
 impl Contract {
     /// The canonical contract for the Minecraft version we currently track.
     ///
-    /// `game_anchor` values are placeholders until pass detection lands (M2);
-    /// the *shape* of this data is what codegen and the shim build against.
+    /// `game_anchor` values below are exact `VK_EXT_debug_utils` label
+    /// strings observed live from Minecraft 26.2's own Vulkan backend
+    /// (`--graphicsBackend VULKAN --vulkanValidation true`, real world, not
+    /// testkit's synthetic anchors) — matched by [`ferridian_engine::frame`]
+    /// via exact string equality against the innermost open label at
+    /// `vkCmdBeginRenderPass`. Kinds Minecraft didn't exercise in that
+    /// session (no rain, no block-entity/particle/held-item draw observed)
+    /// keep the `todo/` placeholder rather than a guessed string.
     pub fn current() -> Contract {
+        fn anchor(kind: GamePassKind) -> String {
+            match kind {
+                GamePassKind::Sky => "Sky sun".to_owned(),
+                GamePassKind::Terrain => "Section layers for opaque".to_owned(),
+                GamePassKind::Entities => {
+                    "Immediate draw with minecraft:pipeline/entity_cutout".to_owned()
+                }
+                GamePassKind::Translucent => "Section layers for translucent".to_owned(),
+                GamePassKind::Gui => "GUI after blur".to_owned(),
+                GamePassKind::BlockEntities
+                | GamePassKind::Particles
+                | GamePassKind::Weather
+                | GamePassKind::Hand
+                | GamePassKind::Unknown => format!("todo/{}", kind.as_str()),
+            }
+        }
         Contract {
             version: CONTRACT_VERSION,
             minecraft_version: "26.2".to_owned(),
@@ -179,7 +201,7 @@ impl Contract {
                 .iter()
                 .map(|&kind| PassDescriptor {
                     kind,
-                    game_anchor: format!("todo/{}", kind.as_str()),
+                    game_anchor: anchor(kind),
                 })
                 .collect(),
         }

@@ -3,6 +3,7 @@
 /.gradle
 /shim/.gradle
 /shim/**/build
+/shim/**/run
 /docs/book
 /.DS_Store
 *.iml

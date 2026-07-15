@@ -23,6 +23,7 @@ gpu-allocator = { workspace = true }
 # (PackCompositor/TapRegistry); the layer only feeds it intercepted events.
 ferridian-vk-rt = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 ferridian-contract = { workspace = true }

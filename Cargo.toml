@@ -58,6 +58,7 @@ sha1_smol = "1.0"
 thiserror = "2.0"
 toml = "0.8"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "2.12", features = ["json"] }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 

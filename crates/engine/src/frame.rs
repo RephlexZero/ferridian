@@ -111,9 +111,16 @@ mod tests {
         PassObserver::new(&Contract::current())
     }
 
-    /// `Contract::current()` anchors are `todo/<wire name>` placeholders.
+    /// The real anchor `Contract::current()` uses for `kind` — kept in sync
+    /// with it (rather than guessing a format) so these tests don't drift
+    /// out from under real anchor updates.
     fn anchor(kind: GamePassKind) -> String {
-        format!("todo/{}", kind.as_str())
+        Contract::current()
+            .passes
+            .into_iter()
+            .find(|pass| pass.kind == kind)
+            .expect("every GamePassKind has a pass entry")
+            .game_anchor
     }
 
     #[test]

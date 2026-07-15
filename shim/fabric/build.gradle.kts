@@ -30,6 +30,25 @@ dependencies {
     implementation(project(":core"))
 }
 
+loom {
+    runs {
+        named("client") {
+            // 26.x's Vulkan backend is opt-in (OpenGL remains the default
+            // until removal, ~2027); this is the engine's actual seam, so
+            // dev-testing the shim against the OpenGL backend proves nothing.
+            programArgs("--graphicsBackend", "VULKAN")
+            // Debug-utils labels (what our layer classifies passes against)
+            // are gated behind Mojang's own validation flag, not free on
+            // every run.
+            programArgs("--vulkanValidation", "true")
+            // Auto-creates/joins a real world instead of idling at the title
+            // screen, so real per-frame world passes (terrain, entities,
+            // sky, ...) actually render for the layer to observe.
+            programArgs("--quickPlaySingleplayer", "ferridian-dev")
+        }
+    }
+}
+
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
     options.release.set(25)

@@ -36,7 +36,27 @@ fn with_observer<T>(observe: impl FnOnce(&mut PassObserver) -> T) -> T {
     observe(observer)
 }
 
+/// Wires up `tracing`'s output for real host processes (tests install their
+/// own subscriber). Opt-in via `RUST_LOG`/`FERRIDIAN_LOG` so a host with
+/// neither set pays nothing beyond the `EnvFilter` check; `try_init` because
+/// a multi-instance host calls this more than once and a second subscriber
+/// must be a no-op, not a panic.
+fn init_logging() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_env("FERRIDIAN_LOG")
+            .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
+
 pub(crate) fn instance_created() {
+    init_logging();
     tracing::debug!("ferridian layer: instance created");
 }
 
@@ -152,6 +172,7 @@ pub(crate) fn render_pass_begun() -> GamePassKind {
 }
 
 pub(crate) fn label_begun(name: &str) {
+    tracing::trace!(name, "ferridian layer: debug-utils label begun");
     with_observer(|observer| observer.label_begun(name));
 }
 
