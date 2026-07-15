@@ -45,7 +45,7 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M3 done and the layer↔executor seam closed — the layer runs loaded packs over intercepted frames
+## Status: M3 done, Executor v1 complete — the layer runs loaded packs over intercepted frames
 
 M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
 blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
@@ -79,7 +79,15 @@ fails the build. Packs mix pipeline kinds now: the volumetric pass is a
 bindings straight from the SPIR-V word stream; the executor barriers the
 output between `GENERAL` and sampled around each dispatch), and converting
 it from fragment to compute reproduced the blessed golden byte for byte.
-Packs
+**Executor v1 is now complete**: graphics passes can write multiple render
+targets (reflection reads `SV_TargetN`'s attachment locations, the planner
+holds them against the manifest's declared outputs in order, the executor
+builds one attachment/blend-state per target), each input samples through
+a per-pass declared filter (`filters = { name = "linear" }`, nearest by
+default — the only mode legal on every depth format), and every pack
+allocation — intermediates, the camera buffer, compositor taps — comes from
+a shared `gpu-allocator` instance per device rather than one dedicated
+`vkAllocateMemory` per resource. Packs
 now read per-frame state through the contract's `camera` uniform block
 (std140, one field table drives the Rust encoder and the generated Java
 mirror), and the executor owns the buffer — updates are proven live
@@ -106,7 +114,6 @@ Follow-ups tracked toward M2+:
 
 - [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
 - [ ] Real-game attachment tapping: intercept `vkCreateImage` to force `TRANSFER_SRC` on attachment usage, and cover `vkCreateRenderPass2`/dynamic rendering (only the classic render-pass path is intercepted today)
-- [ ] Executor v1 (remaining): multiple render targets, per-binding sampler filters, gpu-allocator — compute passes landed (dispatch from reflected workgroup size, storage-image output, `GENERAL`↔sampled barriers), uniform buffers landed with the contract camera
 - [ ] Shim → layer transport for per-frame camera state (the compositor uploads `CameraUniforms::placeholder()` until then)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] cargo-vet audit seed + release attestations; cargo-semver-checks on publish
