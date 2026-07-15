@@ -25,6 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use ash::vk;
 use ash::vk::Handle;
 use ferridian_contract::GamePassKind;
+use ferridian_vk_rt::{ResolvedFrame, TapRegistry};
 
 // Two modules, never one mixing both entry points — that's exactly the shape
 // GPU-assisted validation can't instrument.
@@ -48,11 +49,30 @@ fn overlay_fragment_words() -> &'static [u32] {
     WORDS.get_or_init(|| words_of(OVERLAY_FRAGMENT_SPV))
 }
 
+/// How a render pass's attachments are found — the two ways Vulkan has of
+/// starting one.
+#[derive(Clone, Copy)]
+pub(crate) enum PassGeometry {
+    /// A classic (or `RenderPass2`) render pass instance: resolved from the
+    /// `(render_pass, framebuffer)` pair via [`TapRegistry::resolve`] at
+    /// `vkCmdEndRenderPass{,2}` time. Also what the embedded overlay needs to
+    /// build a render-pass-compatible pipeline.
+    RenderPass {
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+    },
+    /// Dynamic rendering (`vkCmdBeginRendering`) has no render-pass or
+    /// framebuffer object at all, and `vkCmdEndRendering` takes no
+    /// parameters — so the attachments are resolved once, at
+    /// `vkCmdBeginRendering` time, and carried here. `None` when resolution
+    /// failed (an attachment view the layer never saw created).
+    Dynamic { resolved: Option<ResolvedFrame> },
+}
+
 /// A render pass currently being recorded into a command buffer, keyed by
 /// the command buffer's raw handle (unique among live command buffers).
 pub(crate) struct ActivePass {
-    pub render_pass: vk::RenderPass,
-    pub framebuffer: vk::Framebuffer,
+    pub geometry: PassGeometry,
     pub render_area: vk::Rect2D,
     /// How the contract classified this pass; the compositors only ever
     /// touch classified passes — Unknown is forwarded untouched.
@@ -62,6 +82,28 @@ pub(crate) struct ActivePass {
 impl ActivePass {
     pub(crate) fn classified(&self) -> bool {
         self.kind != GamePassKind::Unknown
+    }
+
+    /// The render pass handle, when this pass has one — `None` for dynamic
+    /// rendering, which the embedded overlay skeleton doesn't support (it
+    /// builds pipelines against a `VkRenderPass`; a real pack's own
+    /// `PackCompositor` doesn't need one at all).
+    pub(crate) fn render_pass(&self) -> Option<vk::RenderPass> {
+        match self.geometry {
+            PassGeometry::RenderPass { render_pass, .. } => Some(render_pass),
+            PassGeometry::Dynamic { .. } => None,
+        }
+    }
+
+    /// Resolve this pass to concrete attachments, however it began.
+    pub(crate) fn resolve(&self, taps: &TapRegistry) -> Option<ResolvedFrame> {
+        match self.geometry {
+            PassGeometry::RenderPass {
+                render_pass,
+                framebuffer,
+            } => taps.resolve(render_pass, framebuffer),
+            PassGeometry::Dynamic { resolved } => resolved,
+        }
     }
 }
 
@@ -218,7 +260,13 @@ impl Overlay {
     /// runs at `vkCmdEndRenderPass` time — after every application draw in
     /// the pass, before the pass closes.
     pub(crate) fn composite(&mut self, command_buffer: vk::CommandBuffer, pass: &ActivePass) {
-        let Some(pipeline) = self.pipeline_for(pass.render_pass) else {
+        // Dynamic rendering has no `VkRenderPass` to build a compatible
+        // pipeline against — this skeleton stays out of those passes;
+        // `PackCompositor` (a real pack) doesn't have this limitation.
+        let Some(render_pass) = pass.render_pass() else {
+            return;
+        };
+        let Some(pipeline) = self.pipeline_for(render_pass) else {
             return;
         };
         let viewport = vk::Viewport::default()

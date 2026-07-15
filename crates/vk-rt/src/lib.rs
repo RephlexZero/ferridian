@@ -108,16 +108,14 @@ impl VkRuntime {
         let mut layers: Vec<*const c_char> = Vec::new();
         let mut extensions: Vec<*const c_char> = Vec::new();
         let installed = installed_layers(&entry)?;
-        if options.enable_validation {
-            if !installed
-                .iter()
-                .any(|name| name == "VK_LAYER_KHRONOS_validation")
-            {
-                return Err(RuntimeError::ValidationUnavailable);
-            }
-            layers.push(VALIDATION_LAYER.as_ptr());
-            extensions.push(debug_utils::NAME.as_ptr());
-        }
+        // `ppEnabledLayerNames` order is the call-chain order: the first
+        // layer sits closest to the application, the last closest to the
+        // driver. `extra_layers` (the Ferridian layer, in every test that
+        // enables it) goes *first* so its parameter rewrites (e.g.
+        // `vkCreateImage` forcing `TRANSFER_SRC` onto attachment-usage
+        // images) are what validation itself sees and checks against —
+        // listed after, validation would instead record the *app's*
+        // original, unpatched parameters and never observe the fix.
         let extra_layers: Vec<CString> = options
             .extra_layers
             .iter()
@@ -132,6 +130,16 @@ impl VkRuntime {
             })
             .collect::<Result<_, _>>()?;
         layers.extend(extra_layers.iter().map(|name| name.as_ptr()));
+        if options.enable_validation {
+            if !installed
+                .iter()
+                .any(|name| name == "VK_LAYER_KHRONOS_validation")
+            {
+                return Err(RuntimeError::ValidationUnavailable);
+            }
+            layers.push(VALIDATION_LAYER.as_ptr());
+            extensions.push(debug_utils::NAME.as_ptr());
+        }
 
         let validation_messages: Arc<Mutex<Vec<String>>> = Arc::default();
 
@@ -200,16 +208,26 @@ impl VkRuntime {
         // slangc-compiled shaders routinely declare the DrawParameters
         // capability (SV_VertexID and friends), which is only legal with the
         // 1.1-core shaderDrawParameters feature enabled — so enable it
-        // wherever the device offers it.
+        // wherever the device offers it. Dynamic rendering is a 1.3 feature
+        // bit, not implied merely by requesting API 1.3 — the layer's
+        // `vkCmdBeginRendering` interception needs it actually enabled on
+        // devices this runtime creates (testkit's layered tests, in
+        // particular) to exercise that path at all.
         let mut supported_11 = vk::PhysicalDeviceVulkan11Features::default();
-        let mut supported = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_11);
+        let mut supported_13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut supported = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut supported_11)
+            .push_next(&mut supported_13);
         // SAFETY: physical_device comes from this instance; the structs are live.
         unsafe { instance.get_physical_device_features2(physical_device, &mut supported) };
         let mut enabled_11 = vk::PhysicalDeviceVulkan11Features::default()
             .shader_draw_parameters(supported_11.shader_draw_parameters == vk::TRUE);
+        let mut enabled_13 = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(supported_13.dynamic_rendering == vk::TRUE);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
-            .push_next(&mut enabled_11);
+            .push_next(&mut enabled_11)
+            .push_next(&mut enabled_13);
         // SAFETY: physical_device comes from this instance; create info outlives the call.
         let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
         // SAFETY: the queue family/index were validated during device creation.

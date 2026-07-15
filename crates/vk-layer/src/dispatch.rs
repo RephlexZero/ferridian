@@ -77,6 +77,34 @@ pub(crate) type PfnDestroyRenderPass = for<'a> unsafe extern "system" fn(
     *const vk::AllocationCallbacks<'a>,
 );
 
+pub(crate) type PfnCreateImage = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    *const vk::ImageCreateInfo<'a>,
+    *const vk::AllocationCallbacks<'a>,
+    *mut vk::Image,
+) -> vk::Result;
+
+pub(crate) type PfnCreateRenderPass2 = for<'a> unsafe extern "system" fn(
+    vk::Device,
+    *const vk::RenderPassCreateInfo2<'a>,
+    *const vk::AllocationCallbacks<'a>,
+    *mut vk::RenderPass,
+) -> vk::Result;
+
+pub(crate) type PfnCmdBeginRenderPass2 = for<'a> unsafe extern "system" fn(
+    vk::CommandBuffer,
+    *const vk::RenderPassBeginInfo<'a>,
+    *const vk::SubpassBeginInfo<'a>,
+);
+
+pub(crate) type PfnCmdEndRenderPass2 =
+    for<'a> unsafe extern "system" fn(vk::CommandBuffer, *const vk::SubpassEndInfo<'a>);
+
+pub(crate) type PfnCmdBeginRendering =
+    for<'a> unsafe extern "system" fn(vk::CommandBuffer, *const vk::RenderingInfo<'a>);
+
+pub(crate) type PfnCmdEndRendering = unsafe extern "system" fn(vk::CommandBuffer);
+
 /// Down-chain state for one live `VkInstance`.
 pub(crate) struct InstanceState {
     pub instance: vk::Instance,
@@ -101,6 +129,19 @@ pub(crate) struct DeviceState {
     pub destroy_framebuffer: Option<PfnDestroyFramebuffer>,
     pub create_render_pass: Option<PfnCreateRenderPass>,
     pub destroy_render_pass: Option<PfnDestroyRenderPass>,
+    pub create_image: Option<PfnCreateImage>,
+    pub create_render_pass2: Option<PfnCreateRenderPass2>,
+    pub cmd_begin_render_pass2: Option<PfnCmdBeginRenderPass2>,
+    pub cmd_end_render_pass2: Option<PfnCmdEndRenderPass2>,
+    pub cmd_begin_rendering: Option<PfnCmdBeginRendering>,
+    pub cmd_end_rendering: Option<PfnCmdEndRendering>,
+    /// A full instance table + physical device, so `vkCreateImage` can query
+    /// `vkGetPhysicalDeviceImageFormatProperties` before forcing
+    /// `TRANSFER_SRC` onto an attachment-usage image (the layer's own
+    /// gpu-allocator setup already builds one of these; this is the same
+    /// table, kept for this second use).
+    pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
     /// The overlay's per-device Vulkan objects; `None` when creation
     /// failed (the embedded overlay then stays off for this device).
     pub overlay: Mutex<Option<Overlay>>,

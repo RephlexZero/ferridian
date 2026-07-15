@@ -103,6 +103,39 @@ impl TapRegistry {
         self.render_passes.remove(&render_pass.as_raw());
     }
 
+    /// Resolve a dynamic-rendering pass directly from its attachment image
+    /// views and final layouts — `vkCmdBeginRendering` has no
+    /// framebuffer/render-pass object to key off (unlike classic render
+    /// passes, whose indirection [`TapRegistry::resolve`] walks). `None` when
+    /// the color view is unknown (an unintercepted create) — the caller then
+    /// simply doesn't composite, it never guesses. The depth attachment is
+    /// best-effort: an unknown depth view degrades to no depth rather than
+    /// failing the whole resolve.
+    pub fn resolve_views(
+        &self,
+        extent: vk::Extent2D,
+        color: (vk::ImageView, vk::ImageLayout),
+        depth: Option<(vk::ImageView, vk::ImageLayout)>,
+    ) -> Option<ResolvedFrame> {
+        let resolve_one = |view: vk::ImageView, final_layout: vk::ImageLayout| {
+            self.views
+                .get(&view.as_raw())
+                .map(|record| ResolvedAttachment {
+                    image: record.image,
+                    view,
+                    format: record.format,
+                    final_layout,
+                })
+        };
+        let color = resolve_one(color.0, color.1)?;
+        let depth = depth.and_then(|(view, layout)| resolve_one(view, layout));
+        Some(ResolvedFrame {
+            extent,
+            color,
+            depth,
+        })
+    }
+
     /// Resolve a begun pass to its attachments. `None` whenever anything is
     /// unknown or mismatched (imageless framebuffer, an unintercepted create,
     /// attachment-count disagreement, no color attachment) — the caller then
@@ -313,5 +346,55 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn resolve_views_reads_straight_from_the_view_registry() {
+        let registry = registry_with_scene();
+        let frame = registry
+            .resolve_views(
+                EXTENT,
+                (view(1), vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                Some((view(2), vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)),
+            )
+            .expect("both views are known");
+        assert_eq!(frame.extent, EXTENT);
+        assert_eq!(frame.color.image, vk::Image::from_raw(10));
+        assert_eq!(
+            frame.color.final_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        );
+        let depth = frame.depth.expect("depth attachment present");
+        assert_eq!(depth.image, vk::Image::from_raw(20));
+
+        // No depth attachment at all: still resolves, with `depth: None`.
+        let color_only = registry
+            .resolve_views(
+                EXTENT,
+                (view(1), vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                None,
+            )
+            .expect("color-only resolves");
+        assert!(color_only.depth.is_none());
+
+        // An unknown color view fails outright; an unknown depth view just
+        // degrades to no depth.
+        assert!(
+            registry
+                .resolve_views(
+                    EXTENT,
+                    (view(999), vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                    None
+                )
+                .is_none()
+        );
+        let unknown_depth = registry
+            .resolve_views(
+                EXTENT,
+                (view(1), vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                Some((view(999), vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)),
+            )
+            .expect("color view is known");
+        assert!(unknown_depth.depth.is_none());
     }
 }
