@@ -162,10 +162,23 @@ alongside it. Supply-chain: `cargo-vet` is seeded (`supply-chain/`, every
 current dependency audited or exempted) and wired into the `gates` CI job
 alongside `cargo-deny`.
 
+Most `crates/contract` pass anchors are real now, not `todo/*` placeholders:
+harvested live from Minecraft 26.2's actual `VK_EXT_debug_utils` labels by
+booting the real client headlessly in-container (no GPU passthrough needed —
+Xvfb + lavapipe; see the follow-up below for the exact recipe) and grepping
+the layer's own debug-utils interception for the strings Blaze3D really
+pushes. Classification against a live game is proven this way (real
+per-frame `terrain`/`translucent`/`sky`/`entities`/`gui` counts, not
+testkit's synthetic anchors); `block_entities`/`particles`/`weather`/`hand`
+stay `todo/*` honestly since nothing exercised them in that session. The
+reference pack loads and wires against the real device with no errors — but
+the actual visual composite has **not** been confirmed on screen yet (next
+follow-up).
+
 Follow-ups tracked toward M2+:
 
-- [ ] vk-layer: injection into a real game process; anchors from Blaze3D's real debug groups (M2)
-- [ ] Real Minecraft-side camera capture (sun angle, clip planes) over the now-existing shim → layer transport — waits on the same real-game injection as above
+- [ ] **Get the reference pack actually visible on a real frame.** Anchors/classification are proven against a live game (above); the composite itself isn't. Suspects, roughly in order to check: (1) no positive log confirms `PackCompositor::record_over` actually ran — `end_render_pass_common` in `crates/vk-layer/src/lib.rs` only logs on the *failure* path (`"trigger pass not resolvable to attachments"`), so add a success-path trace too; (2) `composite_trigger` (`crates/engine/src/frame.rs`) assumes `Translucent` is the last world pass before hand/GUI, carried over from the classic OpenGL pipeline order — never checked against Mojang's real Vulkan-mode pass ordering, which may differ; (3) the shadows/deferred passes still read `CameraUniforms::placeholder()`, not real captured camera state (`FerridianShim.onInitializeClient()` in `shim/fabric/src/main/java/io/ferridian/shim/FerridianShim.java` still just logs a line — no `System.load`, no `NativeBridge.publishCamera` call, ever), so even a working composite could look deceptively close to vanilla. To re-run the real-game harness: extract Xvfb (`apt-get install --download-only` + `dpkg -x`, no root needed) and set up a `VK_LAYER_FERRIDIAN_overlay` dir with the built cdylib + manifest; launch via `gradle -p shim :fabric:runClient` with `DISPLAY` pointed at the Xvfb display, `VK_ICD_FILENAMES` at `lvp_icd.json`, `VK_ADD_LAYER_PATH`/`VK_INSTANCE_LAYERS` for the layer, `FERRIDIAN_PACK` at `packs/reference/build`; Loom `programArgs` need `--graphicsBackend VULKAN --vulkanValidation true` (both undocumented, found via the client jar's own bytecode) to get Mojang's real Vulkan backend instead of the OpenGL default; a first-run "Continue" screen blocks everything including `--quickPlaySingleplayer` until dismissed, so extract `xdotool` the same no-root way to click through and into a world; `--quickPlaySingleplayer <name>` only *joins* an existing save of that exact name, it doesn't create one.
+- [ ] Real Minecraft-side camera capture (sun angle, clip planes) over the now-existing shim → layer transport — see suspect (3) above; this no longer waits on real-game injection (that part's proven), it's just unwritten
 - [ ] `shim/neoforge`: a sibling module depending on `shim/core`, via NeoForge's ModDevGradle (plan in overhaul.md §3.4; NeoForge maven is already reachable from CI/devcontainer)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
 - [ ] Release attestations; cargo-semver-checks on publish (still blocked: every workspace crate is `publish = false`)
