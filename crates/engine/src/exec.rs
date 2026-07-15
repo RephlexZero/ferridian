@@ -62,8 +62,22 @@ pub enum WireError {
     StorageImageOutsideCompute { pass: String, name: String },
     #[error("pass {pass}: binds its output as a storage image twice")]
     DuplicateOutputBinding { pass: String },
-    #[error("pass {pass}: declares {count} outputs; execution supports exactly one")]
-    OutputCount { pass: String, count: usize },
+    #[error("pass {pass}: declares no outputs; every pass must write something")]
+    NoOutputs { pass: String },
+    #[error("pass {pass}: compute passes write exactly one output, this one declares {count}")]
+    ComputeOutputCount { pass: String, count: usize },
+    #[error(
+        "pass {pass}: writes {SWAPCHAIN:?} alongside other outputs; the game's image must be its pass's only target"
+    )]
+    SwapchainWithOtherOutputs { pass: String },
+    #[error(
+        "pass {pass}: declares {declared} output(s) but the fragment entry writes locations {locations:?}; outputs map to locations 0..{declared} in manifest order"
+    )]
+    FragmentOutputMismatch {
+        pass: String,
+        declared: usize,
+        locations: Vec<u32>,
+    },
     #[error("pass {pass}: writes {resource:?}, a builtin the game owns")]
     WritesReadOnlyBuiltin { pass: String, resource: String },
     #[error("no pass writes {SWAPCHAIN:?}; the pack would render nothing")]
@@ -131,7 +145,7 @@ pub enum StagePlan {
 }
 
 /// Everything the executor needs to run one pass: entry points, wired
-/// descriptors, and the single target it writes.
+/// descriptors, and the targets it writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassPlan {
     pub name: String,
@@ -141,10 +155,14 @@ pub struct PassPlan {
     /// Descriptor slot of the [`CAMERA`] uniform block, when the pass binds
     /// it. Never collides with any other slot of the pass.
     pub camera_binding: Option<u32>,
-    /// Compute only: the descriptor slot where `output` is bound as a
-    /// storage image (graphics passes write through the attachment instead).
+    /// Compute only: the descriptor slot where the single output is bound as
+    /// a storage image (graphics passes write through attachments instead).
     pub output_binding: Option<u32>,
-    pub output: ResourceId,
+    /// What the pass writes, in manifest order. For a graphics pass, index =
+    /// color attachment location (checked against the fragment entry's
+    /// reflected output locations); a pass writing [`SWAPCHAIN`] writes
+    /// nothing else, and a compute pass has exactly one output.
+    pub outputs: Vec<ResourceId>,
 }
 
 /// A wired, executable schedule derived from a [`LoadedPack`].
@@ -191,26 +209,36 @@ pub fn plan_with_reflections(
         if pass.inputs.iter().any(|input| input == SWAPCHAIN) {
             return Err(WireError::SwapchainRead { pass: err_pass() });
         }
-        if pass.outputs.len() != 1 {
-            return Err(WireError::OutputCount {
+        if pass.outputs.is_empty() {
+            return Err(WireError::NoOutputs { pass: err_pass() });
+        }
+        if is_compute && pass.outputs.len() != 1 {
+            return Err(WireError::ComputeOutputCount {
                 pass: err_pass(),
                 count: pass.outputs.len(),
             });
         }
-        let output = pass.outputs[0].as_str();
-        if output == SWAPCHAIN {
-            if is_compute {
-                return Err(WireError::ComputeSwapchainWrite { pass: err_pass() });
-            }
-            writes_swapchain = true;
-        } else if EXTERNAL_INPUTS.contains(&output) {
-            return Err(WireError::WritesReadOnlyBuiltin {
-                pass: err_pass(),
-                resource: output.to_owned(),
-            });
-        } else {
-            intermediates.push(ResourceId(output.to_owned()));
+        if pass.outputs.iter().any(|output| output == SWAPCHAIN) && pass.outputs.len() != 1 {
+            return Err(WireError::SwapchainWithOtherOutputs { pass: err_pass() });
         }
+        for output in &pass.outputs {
+            if output == SWAPCHAIN {
+                if is_compute {
+                    return Err(WireError::ComputeSwapchainWrite { pass: err_pass() });
+                }
+                writes_swapchain = true;
+            } else if EXTERNAL_INPUTS.contains(&output.as_str()) {
+                return Err(WireError::WritesReadOnlyBuiltin {
+                    pass: err_pass(),
+                    resource: output.clone(),
+                });
+            } else {
+                intermediates.push(ResourceId(output.clone()));
+            }
+        }
+        // The compute output (bound as a storage image below); unused for
+        // graphics, whose outputs are attachments in manifest order.
+        let output = pass.outputs[0].as_str();
 
         let reflection = reflections
             .get(&pass.name)
@@ -226,13 +254,23 @@ pub fn plan_with_reflections(
                 workgroup_size,
             }
         } else {
+            let fragment = single_stage_entry(reflection, "Fragment", &pass.name)?;
+            // The fragment entry must write attachment locations 0..N —
+            // manifest order is the location assignment, and an output the
+            // shader never writes would silently stay black.
+            let declared: Vec<u32> = (0..pass.outputs.len() as u32).collect();
+            if fragment.output_locations != declared {
+                return Err(WireError::FragmentOutputMismatch {
+                    pass: err_pass(),
+                    declared: pass.outputs.len(),
+                    locations: fragment.output_locations.clone(),
+                });
+            }
             StagePlan::Graphics {
                 vertex_entry: single_stage_entry(reflection, "Vertex", &pass.name)?
                     .name
                     .clone(),
-                fragment_entry: single_stage_entry(reflection, "Fragment", &pass.name)?
-                    .name
-                    .clone(),
+                fragment_entry: fragment.name.clone(),
             }
         };
 
@@ -360,7 +398,7 @@ pub fn plan_with_reflections(
             bindings,
             camera_binding,
             output_binding,
-            output: ResourceId(output.to_owned()),
+            outputs: pass.outputs.iter().cloned().map(ResourceId).collect(),
         });
     }
 
@@ -418,19 +456,26 @@ mod tests {
         )
     }
 
-    fn stages() -> Vec<EntryPointReflection> {
+    /// Vertex + fragment entries, the fragment writing `locations`.
+    fn stages_writing(locations: &[u32]) -> Vec<EntryPointReflection> {
         vec![
             EntryPointReflection {
                 name: "vs_main".to_owned(),
                 stage: "Vertex".to_owned(),
                 workgroup_size: None,
+                output_locations: vec![],
             },
             EntryPointReflection {
                 name: "fs_main".to_owned(),
                 stage: "Fragment".to_owned(),
                 workgroup_size: None,
+                output_locations: locations.to_vec(),
             },
         ]
+    }
+
+    fn stages() -> Vec<EntryPointReflection> {
+        stages_writing(&[0])
     }
 
     fn compute_stage(workgroup_size: Option<[u32; 3]>) -> Vec<EntryPointReflection> {
@@ -438,6 +483,7 @@ mod tests {
             name: "cs_main".to_owned(),
             stage: "GLCompute".to_owned(),
             workgroup_size,
+            output_locations: vec![],
         }]
     }
 
@@ -576,7 +622,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, "game_color"), (1, "game_depth"), (2, "shadow_mask")]
         );
-        assert_eq!(plan.passes[2].output, ResourceId("swapchain".into()));
+        assert_eq!(plan.passes[2].outputs, vec![ResourceId("swapchain".into())]);
     }
 
     #[test]
@@ -755,6 +801,7 @@ mod tests {
                     name: "vs_main".to_owned(),
                     stage: "Vertex".to_owned(),
                     workgroup_size: None,
+                    output_locations: vec![],
                 }],
                 bindings: vec![sampler(0, 0, "lit")],
             },
@@ -765,6 +812,123 @@ mod tests {
                 pass: "composite".to_owned(),
                 stage: "Fragment",
                 count: 0,
+            })
+        );
+    }
+
+    /// A gbuffer-shaped pack: one pass writes two targets, the composite
+    /// consumes both.
+    fn mrt_shaped() -> PackManifest {
+        manifest(
+            "[[pass]]\nname = \"gbuffer\"\nkind = \"graphics\"\nshader = \"g.slang\"\n\
+             inputs = [\"game_color\"]\noutputs = [\"albedo\", \"normal\"]\n\
+             [[pass]]\nname = \"composite\"\nkind = \"graphics\"\nshader = \"c.slang\"\n\
+             inputs = [\"albedo\", \"normal\"]\noutputs = [\"swapchain\"]\n",
+        )
+    }
+
+    fn mrt_reflections() -> BTreeMap<String, ShaderReflection> {
+        BTreeMap::from([
+            (
+                "gbuffer".to_owned(),
+                ShaderReflection {
+                    entry_points: stages_writing(&[0, 1]),
+                    bindings: vec![sampler(0, 0, "game_color")],
+                },
+            ),
+            (
+                "composite".to_owned(),
+                reflection(vec![sampler(0, 0, "albedo"), sampler(0, 1, "normal")]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn wires_multiple_render_targets_in_manifest_order() {
+        let plan = plan(&mrt_shaped(), &mrt_reflections()).unwrap();
+        assert_eq!(
+            plan.passes[0].outputs,
+            vec![ResourceId("albedo".into()), ResourceId("normal".into())]
+        );
+        assert_eq!(plan.passes[0].output_binding, None);
+        assert_eq!(
+            plan.intermediates,
+            vec![ResourceId("albedo".into()), ResourceId("normal".into())]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_output_declarations() {
+        // The fragment entry writes fewer locations than the pass declares —
+        // "normal" would silently stay black.
+        let mut reflections = mrt_reflections();
+        reflections.insert(
+            "gbuffer".to_owned(),
+            reflection(vec![sampler(0, 0, "game_color")]),
+        );
+        assert_eq!(
+            plan(&mrt_shaped(), &reflections),
+            Err(WireError::FragmentOutputMismatch {
+                pass: "gbuffer".to_owned(),
+                declared: 2,
+                locations: vec![0],
+            })
+        );
+
+        // And the reverse: a location the pass never declares an output for.
+        let mut reflections = reference_reflections();
+        reflections.insert(
+            "shadows".to_owned(),
+            ShaderReflection {
+                entry_points: stages_writing(&[0, 1]),
+                bindings: vec![sampler(0, 0, "game_depth")],
+            },
+        );
+        assert_eq!(
+            plan(&reference_shaped(), &reflections),
+            Err(WireError::FragmentOutputMismatch {
+                pass: "shadows".to_owned(),
+                declared: 1,
+                locations: vec![0, 1],
+            })
+        );
+
+        // No outputs at all.
+        let headless = manifest(
+            "[[pass]]\nname = \"sink\"\nkind = \"graphics\"\nshader = \"s.slang\"\n\
+             inputs = [\"game_color\"]\noutputs = []\n",
+        );
+        assert_eq!(
+            plan(&headless, &BTreeMap::new()),
+            Err(WireError::NoOutputs {
+                pass: "sink".to_owned(),
+            })
+        );
+
+        // The swapchain sharing a pass with other outputs.
+        let greedy = manifest(
+            "[[pass]]\nname = \"final\"\nkind = \"graphics\"\nshader = \"f.slang\"\n\
+             inputs = [\"game_color\"]\noutputs = [\"swapchain\", \"extra\"]\n",
+        );
+        assert_eq!(
+            plan(&greedy, &BTreeMap::new()),
+            Err(WireError::SwapchainWithOtherOutputs {
+                pass: "final".to_owned(),
+            })
+        );
+
+        // A compute pass declaring two outputs.
+        let wide = manifest(
+            "[[pass]]\nname = \"split\"\nkind = \"compute\"\nshader = \"s.slang\"\n\
+             inputs = [\"game_color\"]\noutputs = [\"a\", \"b\"]\n\
+             [[pass]]\nname = \"composite\"\nkind = \"graphics\"\nshader = \"c.slang\"\n\
+             inputs = [\"a\", \"b\"]\noutputs = [\"swapchain\"]\n",
+        );
+        assert_eq!(
+            plan(&wide, &BTreeMap::new()),
+            Err(WireError::ComputeOutputCount {
+                pass: "split".to_owned(),
+                count: 2,
             })
         );
     }
