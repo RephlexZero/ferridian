@@ -41,10 +41,13 @@ loom {
             // are gated behind Mojang's own validation flag, not free on
             // every run.
             programArgs("--vulkanValidation", "true")
-            // Auto-creates/joins a real world instead of idling at the title
+            // Joins the committed dev save instead of idling at the title
             // screen, so real per-frame world passes (terrain, entities,
-            // sky, ...) actually render for the layer to observe.
-            programArgs("--quickPlaySingleplayer", "ferridian-dev")
+            // sky, ...) actually render for the layer to observe. quickPlay
+            // only *joins* a save of this exact name — it never creates one;
+            // "New World" is the save the first real-game session created
+            // (via xdotool through the vanilla create-world screen).
+            programArgs("--quickPlaySingleplayer", "New World")
         }
     }
 }

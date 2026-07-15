@@ -45,7 +45,7 @@ cargo run -p packc -- build packs/reference
 The devcontainer builds from `ci/mesa.Dockerfile`, so dev and CI share one
 pinned rasteriser; `/dev/dri` is passed through for real-GPU runs.
 
-## Status: M3 done, Executor v1 complete — the layer runs loaded packs over intercepted frames
+## Status: M2 closed visually — the reference pack composites on-screen over a live Minecraft's frames, fed by real camera state
 
 M0 (walking skeleton) and M1 (safety net) are done: golden-image harness with
 blessed lavapipe baselines (`mise run golden-bless`), upstream-watch doing
@@ -99,10 +99,11 @@ published values into a small process-global store
 it every frame instead of a hardcoded constant. Proven end to end by a real
 JVM — not a stand-in — loading the actual cdylib and calling the actual
 generated `NativeBridge.java` via `System.load`, publishing values and
-reading them straight back. What still feeds it the placeholder is real
-Minecraft-side capture (sun angle, clip planes) — like the rest of the
-shim's game-facing code, that waits on real Vulkan layer injection into a
-live game process (the M2 remainder). And the
+reading them straight back. And real Minecraft-side capture now feeds it:
+the shim's `CameraPublisher` polls the live game for sun angle (26.2's
+environment-attribute probe), world time, and clip planes, and the layer's
+compositor consumes them on real frames (see the visible-composite status
+below). And the
 layer↔executor seam is closed: with a pack artifact armed (`FERRIDIAN_PACK`),
 the layer tracks the app's views/framebuffers/render passes, and at the end
 of the world-final classified pass taps its color+depth attachments, runs
@@ -165,22 +166,91 @@ alongside `cargo-deny`.
 Most `crates/contract` pass anchors are real now, not `todo/*` placeholders:
 harvested live from Minecraft 26.2's actual `VK_EXT_debug_utils` labels by
 booting the real client headlessly in-container (no GPU passthrough needed —
-Xvfb + lavapipe; see the follow-up below for the exact recipe) and grepping
-the layer's own debug-utils interception for the strings Blaze3D really
-pushes. Classification against a live game is proven this way (real
-per-frame `terrain`/`translucent`/`sky`/`entities`/`gui` counts, not
-testkit's synthetic anchors); `block_entities`/`particles`/`weather`/`hand`
-stay `todo/*` honestly since nothing exercised them in that session. The
-reference pack loads and wires against the real device with no errors — but
-the actual visual composite has **not** been confirmed on screen yet (next
-follow-up).
+Xvfb + lavapipe; recipe below) and grepping the layer's own debug-utils
+interception for the strings Blaze3D really pushes. Classification against a
+live game is proven this way (real per-frame
+`terrain`/`translucent`/`sky`/`entities`/`gui` counts, not testkit's
+synthetic anchors); `block_entities`/`particles`/`weather`/`hand` stay
+`todo/*` honestly since nothing exercised them in that session.
+
+**The reference pack now visibly composites over real game frames**
+(2026-07-15, all three suspects from the previous session resolved). The
+root cause of the invisible composite was none of the pass-order guesses:
+the volumetric compute pipeline failed `vkCreateComputePipelines` with
+`ERROR_VALIDATION_FAILED_EXT` on the game's device, because slangc emits
+`StorageImage{Read,Write}WithoutFormat` capabilities for an unformatted
+`RWTexture2D` and a real game — unlike testkit — doesn't enable those
+optional features (and Mojang's `--vulkanValidation true`, the same flag
+that produces the anchor labels, turns validation errors into hard
+failures). Fixed by declaring `[format("rgba16f")]` on the storage image.
+Finding it exposed a lying success metric: the layer counted "composites"
+even when `record_over` bailed on its disabled path — it now returns whether
+it actually recorded, and `ferridian_layer_composite_count` /
+the `"pack composite recorded"` info line only count real recordings.
+Proof is visual and live: a hot-swapped inverted-composite generation flips
+the whole world (HUD/hand/clouds still vanilla on top, exactly the designed
+seam), the next generation restores it, and a broken generation (probe
+shader whose dead-code elimination unbound `game_color`) is rejected at
+wire time while the old compositor keeps running. The shim side is real
+too: `FerridianShim` now `System.load`s the layer cdylib
+(`FERRIDIAN_LAYER_LIB`) and a `CameraPublisher` daemon thread polls
+`Minecraft.getInstance()` at tick rate, publishing real sun direction (from
+the 26.2 environment-attribute probe), world-clock time, and clip planes
+through the generated `NativeBridge` — confirmed flowing in the live run.
+
+The real 26.2 Vulkan frame order (from per-pass attachment tracing, now a
+trace-level layer feature): atlas/lightmap upkeep → sky → `Section layers
+for opaque` → `Section layers for translucent` → **Clouds → translucent
+entity immediate draws** → `Blit render target` → GUI blur post chain →
+GUI — every world/UI pass rendering into the *same* 854×480 color
+attachment. So translucent is *not* the last world content (clouds and
+translucent entities draw over the composite — acceptable, documented on
+`composite_trigger`), and Mojang's "blit" is a fullscreen draw into the
+same image, not a copy to another target.
 
 Follow-ups tracked toward M2+:
 
-- [ ] **Get the reference pack actually visible on a real frame.** Anchors/classification are proven against a live game (above); the composite itself isn't. Suspects, roughly in order to check: (1) no positive log confirms `PackCompositor::record_over` actually ran — `end_render_pass_common` in `crates/vk-layer/src/lib.rs` only logs on the *failure* path (`"trigger pass not resolvable to attachments"`), so add a success-path trace too; (2) `composite_trigger` (`crates/engine/src/frame.rs`) assumes `Translucent` is the last world pass before hand/GUI, carried over from the classic OpenGL pipeline order — never checked against Mojang's real Vulkan-mode pass ordering, which may differ; (3) the shadows/deferred passes still read `CameraUniforms::placeholder()`, not real captured camera state (`FerridianShim.onInitializeClient()` in `shim/fabric/src/main/java/io/ferridian/shim/FerridianShim.java` still just logs a line — no `System.load`, no `NativeBridge.publishCamera` call, ever), so even a working composite could look deceptively close to vanilla. To re-run the real-game harness: extract Xvfb (`apt-get install --download-only` + `dpkg -x`, no root needed) and set up a `VK_LAYER_FERRIDIAN_overlay` dir with the built cdylib + manifest; launch via `gradle -p shim :fabric:runClient` with `DISPLAY` pointed at the Xvfb display, `VK_ICD_FILENAMES` at `lvp_icd.json`, `VK_ADD_LAYER_PATH`/`VK_INSTANCE_LAYERS` for the layer, `FERRIDIAN_PACK` at `packs/reference/build`; Loom `programArgs` need `--graphicsBackend VULKAN --vulkanValidation true` (both undocumented, found via the client jar's own bytecode) to get Mojang's real Vulkan backend instead of the OpenGL default; a first-run "Continue" screen blocks everything including `--quickPlaySingleplayer` until dismissed, so extract `xdotool` the same no-root way to click through and into a world; `--quickPlaySingleplayer <name>` only *joins* an existing save of that exact name, it doesn't create one.
-- [ ] Real Minecraft-side camera capture (sun angle, clip planes) over the now-existing shim → layer transport — see suspect (3) above; this no longer waits on real-game injection (that part's proven), it's just unwritten
+- [ ] **Minecraft 26.2's Vulkan backend uses reversed-Z** (proven live: a
+  hot-swapped depth-visualizing generation renders sky ≈ 0.0, near ground
+  bright). The pack's `linearize_depth` (`packs/reference/shaders/common.slang`)
+  assumes conventional depth, so screen-space shadows and fog are wrong on
+  real frames — dark-ambient-only output even in daylight (night is
+  legitimately dark: the sun term goes to zero, and the zombie that killed
+  the test player agrees). Fix `linearize_depth` for reversed-Z
+  (`near*far / (near + d*(far-near))` for finite reversed), and make
+  testkit's synthetic game frames reversed-Z too so the goldens stay
+  representative — that re-bless is why this didn't land as a drive-by.
+- [ ] The reference pack has no ambient/skylight floor beyond `0.25*albedo`,
+  so nighttime is near-black; add a lightmap-aware or sky-ambient term when
+  real material taps land.
+- [ ] Consider layer-side `vkCreateDevice` feature patching
+  (`shaderStorageImage{Read,Write}WithoutFormat` when the physical device
+  supports them) as defense-in-depth for arbitrary packs' unformatted
+  storage images; today `packc`-built packs should declare formats instead.
 - [ ] `shim/neoforge`: a sibling module depending on `shim/core`, via NeoForge's ModDevGradle (plan in overhaul.md §3.4; NeoForge maven is already reachable from CI/devcontainer)
 - [ ] Switch CI gpu job to the immutable GHCR image tag once `container.yml` has pushed one
+
+Real-game harness recipe (in-container, no root): `apt-get download` +
+`dpkg -x` Xvfb, xdotool, x11-apps (xwd), x11-xkb-utils and xkb-data plus the
+handful of libs `ldd` reports missing; Ubuntu's Xvfb hardcodes
+`/usr/bin/xkbcomp` and `/var/lib/xkb/` (no root, no user namespaces in the
+sandbox), so binary-patch those two strings to same-length `/tmp` paths and
+point a wrapper script at the extracted xkbcomp. Run Xvfb with `-xkbdir` at
+the extracted keymaps, then `gradle -p shim :fabric:runClient` with
+`DISPLAY`, `VK_ICD_FILENAMES=…/lvp_icd.json`, `VK_ADD_LAYER_PATH` +
+`VK_INSTANCE_LAYERS` at a dir holding the built cdylib + manifest,
+`FERRIDIAN_PACK=packs/reference/build`, `FERRIDIAN_LAYER_LIB` at the same
+cdylib (the shim's `System.load` — same .so the loader maps, one set of
+process globals), and `FERRIDIAN_LOG` (`ferridian_vk_layer=trace` for the
+per-pass attachment map). Loom already passes `--graphicsBackend VULKAN
+--vulkanValidation true --quickPlaySingleplayer "New World"` — quickPlay
+only *joins* a save of that exact name ("New World" is committed history
+from the first session's xdotool run through the create-world screen).
+Hot reload against the armed dir: `packc serve packs/reference` — note a
+restarted serve renumbers from generation 1, which the in-game watcher has
+already consumed, so touch a shader once to publish generation 2 before
+expecting a swap. Screenshots: `xwd -root` (a tiny xwd→png converter is
+enough; game F2 also works via `xdotool key`).
 - [ ] Release attestations; cargo-semver-checks on publish (still blocked: every workspace crate is `publish = false`)
 - [ ] MoltenVK on GitHub macOS runners — real render or capability-lint only? (open question)
 - [ ] Photon port permission outreach (human task, before any port work)

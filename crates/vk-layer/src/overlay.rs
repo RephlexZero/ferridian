@@ -77,6 +77,9 @@ pub(crate) struct ActivePass {
     /// How the contract classified this pass; the compositors only ever
     /// touch classified passes — Unknown is forwarded untouched.
     pub kind: GamePassKind,
+    /// The innermost debug-utils label open when the pass began — purely
+    /// diagnostic (per-pass attachment tracing against a live game).
+    pub label: Option<String>,
 }
 
 impl ActivePass {

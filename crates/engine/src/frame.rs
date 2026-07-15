@@ -23,9 +23,9 @@ const MAX_LABEL_DEPTH: usize = 64;
 pub struct PassObserver {
     /// `game_anchor` → kind, resolved once at construction.
     anchors: Vec<(String, GamePassKind)>,
-    /// Kinds of the currently open labels, innermost last; `None` for labels
-    /// matching no anchor.
-    label_stack: Vec<Option<GamePassKind>>,
+    /// The currently open labels (name, anchor-matched kind), innermost
+    /// last; kind is `None` for labels matching no anchor.
+    label_stack: Vec<(String, Option<GamePassKind>)>,
     /// Open labels beyond [`MAX_LABEL_DEPTH`], counted so ends stay balanced.
     overflow_depth: u64,
     counts: [u64; GamePassKind::ALL.len()],
@@ -55,7 +55,7 @@ impl PassObserver {
             .iter()
             .find(|(anchor, _)| anchor == name)
             .map(|&(_, kind)| kind);
-        self.label_stack.push(kind);
+        self.label_stack.push((name.to_owned(), kind));
     }
 
     pub fn label_ended(&mut self) {
@@ -76,10 +76,16 @@ impl PassObserver {
             .label_stack
             .iter()
             .rev()
-            .find_map(|&kind| kind)
+            .find_map(|&(_, kind)| kind)
             .unwrap_or(GamePassKind::Unknown);
         self.counts[kind_index(kind)] += 1;
         kind
+    }
+
+    /// The innermost open label, whether or not it matched an anchor —
+    /// diagnostic context for attachment tracing against a live game.
+    pub fn innermost_label(&self) -> Option<&str> {
+        self.label_stack.last().map(|(name, _)| name.as_str())
     }
 
     pub fn count_for(&self, kind: GamePassKind) -> u64 {
@@ -88,9 +94,16 @@ impl PassObserver {
 }
 
 /// Whether a classified pass's end is where the layer runs a loaded pack
-/// over the frame. Translucent is the last world-geometry pass in vanilla's
-/// order, so compositing there transforms the finished world while hand and
-/// GUI still draw on top, untouched by pack lighting or fog.
+/// over the frame.
+///
+/// Checked against Minecraft 26.2's real Vulkan-mode pass order (live
+/// harvest, 2026-07-15): translucent section layers are *not* the final
+/// world content — "Clouds" and translucent-entity immediate draws follow
+/// before the blit/post/GUI chain, all into the same color attachment. They
+/// draw on top of the composite, which is acceptable for now (clouds escape
+/// pack fog exactly like hand and GUI escape pack lighting); moving the
+/// trigger later needs an anchor that exists every frame, which neither
+/// "Clouds" (an option) nor entity immediate draws (view-dependent) are.
 pub fn composite_trigger(kind: GamePassKind) -> bool {
     kind == GamePassKind::Translucent
 }

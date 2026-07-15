@@ -163,13 +163,22 @@ impl PackCompositor {
     /// its own render pass had declared. Called after the app's render pass
     /// has ended in `command_buffer`.
     ///
+    /// Returns whether the pack was actually recorded — `false` covers every
+    /// silent early-out (disabled after a failed build, geometry mismatch),
+    /// so the caller's success accounting can't drift from reality.
+    ///
     /// # Safety
     /// `command_buffer` must be in the recording state and *outside* a render
     /// pass instance, on this device's recording thread; the frame's handles
     /// must be live.
-    pub unsafe fn record_over(&mut self, command_buffer: vk::CommandBuffer, frame: &ResolvedFrame) {
+    #[must_use]
+    pub unsafe fn record_over(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        frame: &ResolvedFrame,
+    ) -> bool {
         if self.disabled {
-            return;
+            return false;
         }
         if self.built.is_none() {
             match self.build(frame) {
@@ -185,12 +194,12 @@ impl PackCompositor {
                 Err(error) => {
                     tracing::warn!(%error, "pack compositing disabled: build failed");
                     self.disabled = true;
-                    return;
+                    return false;
                 }
             }
         }
         let Some(built) = &self.built else {
-            return;
+            return false;
         };
         let geometry_matches = built.extent == frame.extent
             && built.output.view == frame.color.view
@@ -209,7 +218,7 @@ impl PackCompositor {
                 );
                 self.mismatch_warned = true;
             }
-            return;
+            return false;
         }
 
         // Tap copies. One barrier batch in, the copies, one barrier batch out;
@@ -346,6 +355,7 @@ impl PackCompositor {
             );
             built.executor.record(&self.device, command_buffer);
         }
+        true
     }
 
     /// Create the taps and instantiate the executor against one frame

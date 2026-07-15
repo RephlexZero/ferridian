@@ -15,7 +15,13 @@
 Sampler2D game_depth;
 [[vk::binding(1, 0)]]
 Sampler2D shadow_mask;
+// The declared format must match the executor's intermediate images
+// (R16G16B16A16_SFLOAT). Without it the SPIR-V needs the optional
+// shaderStorageImage{Read,Write}WithoutFormat features — which a real game's
+// device does not enable, so pipeline creation fails under the game's own
+// validation (observed live: Minecraft 26.2 with --vulkanValidation true).
 [[vk::binding(2, 0)]]
+[format("rgba16f")]
 RWTexture2D<float4> fog;
 
 static const uint FOG_STEPS = 16;

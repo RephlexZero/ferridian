@@ -24,6 +24,16 @@ pub const PACK_ENV: &str = "FERRIDIAN_PACK";
 /// fact the layer extracts from a host application.
 static RENDER_PASSES_BEGUN: AtomicU64 = AtomicU64::new(0);
 
+/// Pack composites actually recorded over intercepted frames. Zero after a
+/// session that classified trigger passes means the composite path never
+/// ran — exactly the silent failure the success-path logging exists to rule
+/// out.
+static COMPOSITES_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+/// Trigger passes that fired with a pack armed but could not be resolved to
+/// tapped attachments (frame forwarded untouched).
+static COMPOSITES_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+
 /// One observer for the whole process: label state is per-command-buffer on
 /// the Vulkan side, so this assumes single-threaded recording (true of the
 /// test harness and vanilla's render thread). TODO(M2): per-command-buffer
@@ -180,8 +190,51 @@ pub(crate) fn label_ended() {
     with_observer(|observer| observer.label_ended());
 }
 
+/// The innermost open debug-utils label right now — diagnostic context for
+/// per-pass attachment tracing (which image each labeled pass renders into).
+pub(crate) fn innermost_label() -> Option<String> {
+    with_observer(|observer| observer.innermost_label().map(str::to_owned))
+}
+
 pub(crate) fn render_pass_count() -> u64 {
     RENDER_PASSES_BEGUN.load(Ordering::Relaxed)
+}
+
+/// The positive confirmation the composite path ran: info the first time (a
+/// live-game session greps for this one line), trace per frame afterward.
+pub(crate) fn composite_recorded(kind: GamePassKind) {
+    let count = COMPOSITES_RECORDED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 {
+        tracing::info!(
+            kind = kind.as_str(),
+            "pack composite recorded over intercepted frame"
+        );
+    } else {
+        tracing::trace!(count, kind = kind.as_str(), "pack composite recorded");
+    }
+}
+
+/// A trigger pass fired with a pack armed but didn't resolve to attachments:
+/// warn the first time (this is the failure the visible-composite follow-up
+/// hunts), debug afterward to keep a broken session's log readable.
+pub(crate) fn composite_unresolved(kind: GamePassKind) {
+    let count = COMPOSITES_UNRESOLVED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 {
+        tracing::warn!(
+            kind = kind.as_str(),
+            "trigger pass not resolvable to attachments; frame left untouched"
+        );
+    } else {
+        tracing::debug!(
+            count,
+            kind = kind.as_str(),
+            "trigger pass not resolvable to attachments; frame left untouched"
+        );
+    }
+}
+
+pub(crate) fn composite_count() -> u64 {
+    COMPOSITES_RECORDED.load(Ordering::Relaxed)
 }
 
 /// Count of passes classified as `GamePassKind::ALL[kind]`; 0 if out of range.
