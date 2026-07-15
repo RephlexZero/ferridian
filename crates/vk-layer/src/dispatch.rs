@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, RwLock};
 
 use ash::vk;
+use ferridian_engine::pack::PackWatcher;
 use ferridian_vk_rt::{PackCompositor, TapRegistry};
 
 use crate::overlay::Overlay;
@@ -108,6 +109,16 @@ pub(crate) struct DeviceState {
     /// Present when `FERRIDIAN_PACK` named a loadable, wireable pack at
     /// device creation; replaces the embedded overlay when active.
     pub compositor: Mutex<Option<PackCompositor>>,
+    /// Watches the same directory for a newer generation; `None` when
+    /// `FERRIDIAN_PACK` was unset at device creation. Rebuilding a
+    /// [`PackCompositor`] on reload needs the same device/queue/memory
+    /// parameters `compositor` was originally built with, so they're kept
+    /// here too rather than only inside the (possibly absent) compositor.
+    pub pack_watcher: Mutex<Option<PackWatcher>>,
+    pub device: ash::Device,
+    pub queue: vk::Queue,
+    pub queue_family_index: u32,
+    pub memory_properties: vk::PhysicalDeviceMemoryProperties,
 }
 
 static INSTANCES: RwLock<BTreeMap<usize, InstanceState>> = RwLock::new(BTreeMap::new());

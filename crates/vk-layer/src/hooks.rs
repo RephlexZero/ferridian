@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ash::vk;
 use ferridian_contract::{Contract, GamePassKind};
 use ferridian_engine::frame::PassObserver;
-use ferridian_engine::pack::load_pack;
+use ferridian_engine::pack::{PackWatcher, load_pack};
 use ferridian_vk_rt::PackCompositor;
 
 /// Artifact directory to composite over intercepted frames. Read once per
-/// device creation; hot reload through the layer is a follow-up (the engine's
-/// `PackWatcher` is ready for it, the layer needs a safe swap point first).
+/// device creation; a [`PackWatcher`] over the same directory drives hot
+/// reload afterward (see [`create_watcher`] / [`poll_reload`]).
 pub const PACK_ENV: &str = "FERRIDIAN_PACK";
 
 /// Render passes begun through the layer since load. The first observable
@@ -74,6 +74,58 @@ pub(crate) fn create_compositor(
         }
         Err(error) => {
             tracing::warn!(%error, pack = %dir.to_string_lossy(), "pack does not wire; compositing disabled");
+            None
+        }
+    }
+}
+
+/// Build a watcher over the directory [`create_compositor`] loaded from
+/// (`None` if [`PACK_ENV`] is unset), primed against whatever generation is
+/// already published so the first [`poll_reload`] only fires on a build that
+/// lands *after* device creation. A one-shot `packc build` output publishes
+/// no generation file, so priming is a no-op there and the watcher simply
+/// never fires — hot reload only drives directories under `packc serve`.
+pub(crate) fn create_watcher() -> Option<PackWatcher> {
+    let dir = std::env::var_os(PACK_ENV)?;
+    let mut watcher = PackWatcher::new(Path::new(&dir));
+    watcher.poll();
+    Some(watcher)
+}
+
+/// Poll for a newer generation and, if it loads and wires successfully,
+/// return the freshly built compositor to swap in. `None` means keep
+/// whatever compositor is already running — nothing published, or a reload
+/// that failed to load/wire (logged, and not retried: the producer only
+/// moves forward, so the fix arrives as the next generation).
+pub(crate) fn poll_reload(
+    watcher: &mut PackWatcher,
+    device: ash::Device,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+) -> Option<PackCompositor> {
+    let pack = match watcher.poll()? {
+        Ok(pack) => pack,
+        Err(error) => {
+            tracing::warn!(%error, "pack reload failed; keeping the previous compositor");
+            return None;
+        }
+    };
+    match PackCompositor::new(device, queue, queue_family_index, memory_properties, &pack) {
+        Ok(compositor) => {
+            tracing::info!(
+                generation = pack.generation,
+                passes = compositor.pass_count(),
+                "pack reloaded; compositing rearmed"
+            );
+            Some(compositor)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                generation = pack.generation,
+                "reloaded pack does not wire; keeping the previous compositor"
+            );
             None
         }
     }

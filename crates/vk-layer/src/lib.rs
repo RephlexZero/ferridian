@@ -243,6 +243,42 @@ unsafe extern "system" fn ferridian_cmd_end_render_pass(command_buffer: vk::Comm
                 .lock()
                 .expect("tap registry poisoned")
                 .resolve(pass.render_pass, pass.framebuffer);
+            // The composite trigger is the one place we already touch the
+            // compositor every frame, so it doubles as the reload check: at
+            // most one poll per frame, and any swap happens before this
+            // frame's own compositing below.
+            let mut watcher = state
+                .pack_watcher
+                .lock()
+                .expect("pack watcher lock poisoned");
+            if let Some(reloaded) = watcher.as_mut().and_then(|watcher| {
+                hooks::poll_reload(
+                    watcher,
+                    state.device.clone(),
+                    state.queue,
+                    state.queue_family_index,
+                    state.memory_properties,
+                )
+            }) {
+                let mut compositor = state.compositor.lock().expect("compositor lock poisoned");
+                // SAFETY: `device_wait_idle` only waits on work already
+                // submitted in *previous* frames — `command_buffer` is still
+                // being recorded and hasn't been submitted yet, so this
+                // cannot deadlock against it. Once it returns, nothing
+                // GPU-side references the old compositor's objects, which is
+                // exactly `destroy`'s safety requirement.
+                unsafe {
+                    state
+                        .device
+                        .device_wait_idle()
+                        .expect("device wait idle before hot-swapping the pack compositor");
+                    if let Some(old) = compositor.as_mut() {
+                        old.destroy();
+                    }
+                }
+                *compositor = Some(reloaded);
+            }
+            drop(watcher);
             let mut compositor = state.compositor.lock().expect("compositor lock poisoned");
             if let (Some(compositor), Some(frame)) = (compositor.as_mut(), resolved) {
                 // SAFETY: we are on the app's recording thread, immediately
@@ -719,6 +755,7 @@ unsafe extern "system" fn ferridian_create_device(
         queue_family_index,
         memory_properties,
     );
+    let pack_watcher = hooks::create_watcher();
 
     dispatch::insert_device(
         key,
@@ -741,9 +778,14 @@ unsafe extern "system" fn ferridian_create_device(
             destroy_framebuffer: retype!(resolve(c"vkDestroyFramebuffer"), PfnDestroyFramebuffer),
             create_render_pass: retype!(resolve(c"vkCreateRenderPass"), PfnCreateRenderPass),
             destroy_render_pass: retype!(resolve(c"vkDestroyRenderPass"), PfnDestroyRenderPass),
-            overlay: Mutex::new(Overlay::new(device_table)),
+            overlay: Mutex::new(Overlay::new(device_table.clone())),
             taps: Mutex::new(TapRegistry::default()),
             compositor: Mutex::new(compositor),
+            pack_watcher: Mutex::new(pack_watcher),
+            device: device_table,
+            queue,
+            queue_family_index,
+            memory_properties,
         },
     );
     hooks::device_created();
